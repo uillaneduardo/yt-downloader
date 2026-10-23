@@ -319,68 +319,174 @@ def test_playlist_cancel_skips_all_items(monkeypatch):
     assert job['status'] == 'canceled'
     assert [x['status'] for x in statuses] == ['canceled','canceled']
 
-def test_error_codes_distinguish_real_file_size_and_full_disk():
-    assert main.failure_code('ERROR: File is larger than max-filesize') == 'TOO_LARGE'
+
+def test_ytdlp_size_and_storage_errors_are_classified():
+    assert main.failure_code('ERROR: File is larger than max-filesize (1234 > 1000)') == 'TOO_LARGE'
     assert main.failure_code('ERROR: [Errno 28] No space left on device') == 'NO_SPACE'
+    assert '1024' in main.MESSAGES['TOO_LARGE'] or str(main.MAX_FILE_MB) in main.MESSAGES['TOO_LARGE']
 
 
-def test_scratch_files_can_exceed_output_limit(monkeypatch):
-    import hashlib, json, uuid
+def test_intermediate_video_and_audio_do_not_count_as_final_size(monkeypatch):
+    import hashlib
+    import json
+    import uuid
     job_id = uuid.uuid4().hex
-    profile = {'kind':'video', 'ext':'MP4', 'height':720, 'label':'720p'}
+    profile = {'kind': 'video', 'ext': 'MP4', 'height': 720, 'label': '720p'}
     main.init_db()
-    with main.db() as conn:
-        conn.execute("""INSERT INTO jobs(id,token_hash,url,title,profile,metadata,publish,source,
-            status,stage,percent,created) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
-            (job_id,hashlib.sha256(b'token').hexdigest(),
-             'https://www.youtube.com/watch?v=aqz-KE-bpKQ','Teste',json.dumps(profile),
-             0,0,'YouTube','running','Obtendo',None,main.epoch()))
-        row=conn.execute('SELECT * FROM jobs WHERE id=?',(job_id,)).fetchone()
-    monkeypatch.setattr(main,'MAX_BYTES',100)
-    monkeypatch.setattr(main,'MAX_TEMP_BYTES',1024)
-    class Fake:
-        pid=999999
-        def __init__(self,_command,**kwargs):
-            folder=Path(kwargs['cwd'])
-            (folder/'media.mp4').write_bytes(b'x'*50)
-            (folder/'media.webm').write_bytes(b'w'*180)
-            (folder/'media.m4a').write_bytes(b'a'*120)
-            self.stdout=iter(['[Merger]'])
+    with main.db() as c:
+        c.execute('''INSERT INTO jobs (id, token_hash, url, title, profile, metadata, publish,
+            source, status, stage, percent, created) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)''',
+            (job_id, hashlib.sha256(b'token').hexdigest(), 'https://www.youtube.com/watch?v=aqz-KE-bpKQ',
+             'Arquivos intermediários', json.dumps(profile), 0, 0, 'YouTube', 'running', 'Obtendo', None, main.epoch()))
+        row = c.execute('SELECT * FROM jobs WHERE id=?', (job_id,)).fetchone()
+    monkeypatch.setattr(main, 'MAX_BYTES', 100)
+    monkeypatch.setattr(main, 'MAX_TEMP_BYTES', 1024)
+
+    class MockProcess:
+        pid = 999999
+        def __init__(self, command, **kwargs):
+            folder = Path(kwargs['cwd'])
+            (folder / 'media.mp4').write_bytes(b'video' * 10)  # output: 50 bytes
+            (folder / 'media.webm').write_bytes(b'video-stream' * 10)  # intermediate: 120 bytes
+            (folder / 'media.m4a').write_bytes(b'audio-stream' * 10)  # intermediate: 120 bytes
+            self.stdout = iter(['[download] DL:100.0%|100|100|NA', '[Merger] merged'])
         def poll(self): return 0
         def wait(self): return 0
-    monkeypatch.setattr(main.subprocess,'Popen',Fake)
+
+    monkeypatch.setattr(main.subprocess, 'Popen', MockProcess)
     main.execute_job(row)
-    with main.db() as conn:
-        result=conn.execute('SELECT status,error_code,filesize FROM jobs WHERE id=?',(job_id,)).fetchone()
-    assert result['status']=='completed', result['error_code']
-    assert result['filesize']==50
-    assert [p.name for p in (main.WORK/job_id).iterdir()]==['media.mp4']
+    with main.db() as c:
+        result = c.execute('SELECT * FROM jobs WHERE id=?', (job_id,)).fetchone()
+    assert result['status'] == 'completed', result['error_code']
+    assert result['filesize'] == 50
+    assert sorted(path.name for path in (main.WORK / job_id).iterdir()) == ['media.mp4']
 
 
-def test_actual_oversized_output_still_fails(monkeypatch):
-    import hashlib, json, uuid
+def test_actual_oversized_output_remains_blocked(monkeypatch):
+    import hashlib
+    import json
+    import uuid
     job_id = uuid.uuid4().hex
-    profile = {'kind':'video', 'ext':'MP4', 'height':720, 'label':'720p'}
+    profile = {'kind': 'video', 'ext': 'MP4', 'height': 720, 'label': '720p'}
     main.init_db()
-    with main.db() as conn:
-        conn.execute("""INSERT INTO jobs(id,token_hash,url,title,profile,metadata,publish,source,
-            status,stage,percent,created) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
-            (job_id,hashlib.sha256(b'token').hexdigest(),
-             'https://www.youtube.com/watch?v=aqz-KE-bpKQ','Teste',json.dumps(profile),
-             0,0,'YouTube','running','Obtendo',None,main.epoch()))
-        row=conn.execute('SELECT * FROM jobs WHERE id=?',(job_id,)).fetchone()
-    monkeypatch.setattr(main,'MAX_BYTES',100)
-    monkeypatch.setattr(main,'MAX_TEMP_BYTES',1024)
-    class Fake:
-        pid=999999
-        def __init__(self,_command,**kwargs):
-            (Path(kwargs['cwd'])/'media.mp4').write_bytes(b'x'*125)
-            self.stdout=iter(['[Merger]'])
+    with main.db() as c:
+        c.execute('''INSERT INTO jobs (id, token_hash, url, title, profile, metadata, publish,
+            source, status, stage, percent, created) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)''',
+            (job_id, hashlib.sha256(b'token').hexdigest(), 'https://www.youtube.com/watch?v=aqz-KE-bpKQ',
+             'Arquivo acima limite', json.dumps(profile), 0, 0, 'YouTube', 'running', 'Obtendo', None, main.epoch()))
+        row = c.execute('SELECT * FROM jobs WHERE id=?', (job_id,)).fetchone()
+    monkeypatch.setattr(main, 'MAX_BYTES', 100)
+    monkeypatch.setattr(main, 'MAX_TEMP_BYTES', 1024)
+
+    class MockProcess:
+        pid = 999999
+        def __init__(self, command, **kwargs):
+            (Path(kwargs['cwd']) / 'media.mp4').write_bytes(b'video' * 25)
+            self.stdout = iter(['[Merger] merged'])
         def poll(self): return 0
         def wait(self): return 0
-    monkeypatch.setattr(main.subprocess,'Popen',Fake)
+
+    monkeypatch.setattr(main.subprocess, 'Popen', MockProcess)
     main.execute_job(row)
-    with main.db() as conn:
-        result=conn.execute('SELECT status,error_code FROM jobs WHERE id=?',(job_id,)).fetchone()
-    assert result['status']=='failed'
-    assert result['error_code']=='TOO_LARGE'
+    with main.db() as c:
+        result = c.execute('SELECT status,error_code FROM jobs WHERE id=?', (job_id,)).fetchone()
+    assert result['status'] == 'failed'
+    assert result['error_code'] == 'TOO_LARGE'
+
+
+def test_playlist_scratch_not_confused_with_zip_limit(monkeypatch):
+    import zipfile
+    job_id, token, row = build_test_playlist_job(count=2)
+    monkeypatch.setattr(main, 'MAX_BYTES', 100)
+    monkeypatch.setattr(main, 'MAX_TEMP_BYTES', 4096)
+    monkeypatch.setattr(main, 'MAX_PLAYLIST_TOTAL_BYTES', 500)
+    monkeypatch.setattr(main, 'MAX_PLAYLIST_TEMP_BYTES', 4096)
+
+    class MockProcess:
+        pid = 999999
+        def __init__(self, command, **kwargs):
+            folder = Path(kwargs['cwd'])
+            (folder / 'media.mp4').write_bytes(b'x' * 30)
+            (folder / 'media.webm').write_bytes(b'a' * 700)
+            self.stdout = iter(['[Merger] merged'])
+        def poll(self): return 0
+        def wait(self): return 0
+
+    monkeypatch.setattr(main.subprocess, 'Popen', MockProcess)
+    main.execute_playlist_job(row)
+    with main.db() as c:
+        job = c.execute('SELECT * FROM jobs WHERE id=?',(job_id,)).fetchone()
+        statuses = c.execute('SELECT status FROM playlist_items WHERE job_id=? ORDER BY position',(job_id,)).fetchall()
+    assert job['status'] == 'completed', job['error_code']
+    assert [x['status'] for x in statuses] == ['completed','completed']
+    with zipfile.ZipFile(main.WORK / job_id / 'media.zip') as archive:
+        assert len(archive.namelist()) == 2
+
+
+def test_admin_requires_password_and_session(monkeypatch):
+    from fastapi.testclient import TestClient
+    monkeypatch.delenv('ADMIN_PASSWORD', raising=False)
+    with TestClient(main.app) as c:
+        assert c.get('/api/admin/session').json() == {'enabled': False, 'authenticated': False}
+        assert c.get('/api/admin/jobs').status_code == 503
+        assert c.get('/admin').status_code == 200
+    monkeypatch.setenv('ADMIN_PASSWORD', 'super-long-test-password-1234567')
+    with TestClient(main.app) as c:
+        assert c.get('/api/admin/jobs').status_code == 401
+        assert c.post('/api/admin/login', json={'password':'bad'}).status_code == 401
+        login = c.post('/api/admin/login', json={'password':'super-long-test-password-1234567'})
+        assert login.status_code == 200
+        csrf = login.json()['csrf']
+        assert c.get('/api/admin/session').json()['authenticated'] is True
+        # Session refresh rotates CSRF.
+        csrf = c.get('/api/admin/session').json()['csrf']
+        assert c.get('/api/admin/jobs').status_code == 200
+        assert c.put('/api/admin/limits', json={'limits': {'MAX_FILE_MB':2048}}).status_code == 403
+        ok = c.put('/api/admin/limits', headers={'X-Admin-CSRF':csrf}, json={'limits': {'MAX_FILE_MB':2048}})
+        assert ok.status_code == 200, ok.text
+        assert main.MAX_FILE_MB == 2048
+        assert main.MAX_BYTES == 2048 * 1048576
+        assert '2048' in main.MESSAGES['TOO_LARGE']
+        bad = c.put('/api/admin/limits', headers={'X-Admin-CSRF':csrf}, json={'limits': {'MAX_TEMP_MB':64}})
+        assert bad.status_code == 422
+        # Sessions cannot be terminated without CSRF.
+        assert c.post('/api/admin/logout', json={}).status_code == 403
+        assert c.post('/api/admin/logout', json={}, headers={'X-Admin-CSRF':csrf}).status_code == 200
+        assert c.get('/api/admin/jobs').status_code == 401
+    monkeypatch.setattr(main, 'MAX_FILE_MB', 1024)
+    monkeypatch.setattr(main, 'MAX_BYTES', 1024 * 1048576)
+
+
+def test_admin_ip_file_management_and_privacy(monkeypatch):
+    import json, uuid, hashlib
+    from fastapi.testclient import TestClient
+    monkeypatch.setenv('ADMIN_PASSWORD', 'super-long-test-password-1234567')
+    monkeypatch.setattr(main, 'inspect_media', fake_info)
+    monkeypatch.setenv('TRUST_CF_IP', '1')
+    with TestClient(main.app) as c:
+        inspection = c.post('/api/inspect', json={'url':'https://youtu.be/aqz-KE-bpKQ'}).json()['inspectionId']
+        create = c.post('/api/downloads',headers={'cf-connecting-ip':'198.51.100.8'}, json={'inspectionId':inspection, 'profileId':'video-mp4-720'})
+        assert create.status_code == 202, create.text
+        job_id = create.json()['id']
+        login = c.post('/api/admin/login',json={'password':'super-long-test-password-1234567'})
+        csrf = login.json()['csrf']
+        rows = c.get('/api/admin/jobs').json()['items']
+        row = next(r for r in rows if r['id'] == job_id)
+        assert row['client_ip'] == '198.51.100.8'
+        assert row['url'].endswith('aqz-KE-bpKQ')
+        # Active files cannot be deleted from the admin dashboard.
+        blocked = c.delete(f'/api/admin/jobs/{job_id}/files',headers={'X-Admin-CSRF':csrf})
+        assert blocked.status_code == 409
+        folder = main.WORK / job_id
+        folder.mkdir(exist_ok=True)
+        (folder/'media.mp4').write_bytes(b'fake mp4')
+        main.set_job(job_id,status='completed',expires=main.epoch()+1000)
+        removed = c.delete(f'/api/admin/jobs/{job_id}/files',headers={'X-Admin-CSRF':csrf})
+        assert removed.status_code == 200,removed.text
+        assert not folder.exists()
+        assert c.get('/api/admin/storage').status_code == 200
+        with main.db() as db:
+            db.execute('UPDATE jobs SET created=? WHERE id=?', (main.epoch()-86400*8, job_id))
+        main.admin_privacy_cleanup()
+        assert next(r for r in c.get('/api/admin/jobs').json()['items'] if r['id']==job_id)['client_ip'] is None
+        assert c.get('/api/history').json().get('items') is not None
