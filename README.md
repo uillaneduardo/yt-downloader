@@ -20,13 +20,13 @@ Downloader web auto-hospedado de vídeo e áudio (YouTube / Vimeo), com interfac
 ```bash
 cd ~/homelab/apps/yt-downloader
 git fetch origin
-git switch --detach origin/feat/individual-batches-parallel
+git switch main && git pull --ff-only origin main
 sudo docker compose up -d --build
 sudo docker compose ps
 curl -fsS http://127.0.0.1:8098/api/health
 ```
 
-A branch acima depende das alterações administrativas do PR anterior; execute somente após validar o PR na revisão. Não exclua `data/` nem sobrescreva seu `.env`.
+Esta versão é instalada diretamente da main após o merge. Preserve data/ e .env. Não exclua `data/` nem sobrescreva seu `.env`.
 
 Para uma instalação nova, copie `.env.example` para `.env`, configure `ADMIN_PASSWORD` com pelo menos 16 caracteres e use `sudo chown -R 10001:10001 data` antes de iniciar. O serviço permanece em `127.0.0.1:${YT_PORT:-8098}` para uso pelo Cloudflare Tunnel, domínio `yt.ulln.com.br`.
 
@@ -73,3 +73,6 @@ Playlists são listadas em modo plano: a resolução informada é um teto e a qu
 O limite de concorrência não substitui a quota de disco do host. Baixe somente conteúdo que você tenha permissão para usar. Download real em YouTube/Vimeo e funcionamento do Cloudflare Tunnel ainda exigem homologação no homelab.
 
 Veja [docs/DEPLOY.md](docs/DEPLOY.md), [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) e os testes em `tests/test_api.py`.
+## Arquivos no painel de administração
+
+Em **/admin > Arquivos armazenados**, cada trabalho concluído oferece **Baixar** (arquivo original preparado) e **Excluir**. A rota `GET /api/admin/jobs/{id}/file` exige sessão administrativa. Ela nunca aceita caminho fornecido pelo usuário e só serve arquivos já concluídos, disponíveis no armazenamento.
