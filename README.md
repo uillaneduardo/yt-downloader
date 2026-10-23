@@ -6,7 +6,8 @@ Downloader web auto-hospedado de vídeo e áudio (YouTube / Vimeo), com interfac
 
 - Cole **um ou vários links**, separados por vírgula, ponto e vírgula, espaços, tabulações ou linhas (Enter).
 - Aceita URLs de vídeo YouTube/Vimeo e playlists do YouTube. Playlists são expandidas para uma lista de vídeos individuais.
-- Cada vídeo aparece em um card próprio, com seleção de vídeo/áudio, formato e qualidade, botão Preparar arquivo, progresso e Baixar arquivo.\n- Preparar selecionados mantém o processamento coletivo e a concorrência definida pelo visitante.
+- Cada vídeo aparece em um card próprio, com seleção de vídeo/áudio, formato e qualidade, botão Preparar arquivo, progresso e Baixar arquivo.
+- Preparar selecionados mantém o processamento coletivo e a concorrência definida pelo visitante.
 - **Nenhum ZIP é criado para novos lotes**: cada item concluído apresenta seu botão **Baixar** próprio na lista.
 - Escolha **X downloads simultâneos** (de 1 até o teto global do administrador, 2 por padrão, máximo configurável de 8).
 - A fila respeita o máximo global mesmo com vários visitantes. Um erro individual não cancela os demais.
