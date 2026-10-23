@@ -144,3 +144,10 @@ curl -fsS http://127.0.0.1:8098/api/health
 ```
 
 Abra `https://yt.ulln.com.br/admin`. A senha fica no `.env` do servidor; não a inclua no repositório. Configure Cloudflare Access para restringir `/admin` e, preferencialmente, `/api/admin/*`. A interface usa cookies HttpOnly e tokens CSRF.
+
+
+## v0.4.0 — lotes individuais e execução paralela
+
+Após o deploy pelo procedimento principal, em **Admin > Limites** ajuste **Downloads simultâneos** (global). Na página pública, o visitante pode informar várias URLs separadas por vírgula, `;`, espaço ou Enter; expanda uma playlist, selecione apenas os itens desejados e escolha X de 1 até o limite permitido. Cada arquivo finalizado terá botão **Baixar** na própria lista. **Não há ZIP para novos lotes.**
+
+O Compose passa `MAX_PARALLEL_DOWNLOADS=2` como padrão para instalações novas; se você já salvou o limite pelo painel, o SQLite prevalece. Não apague a pasta `data/`. Para validar, escolha duas mídias pequenas de uso autorizado e concorrência 2, e verifique que os dois subprocessos são executados sem exceder a capacidade do homelab. A integração externa de download, conversão e Cloudflare Tunnel exige teste na VM.
