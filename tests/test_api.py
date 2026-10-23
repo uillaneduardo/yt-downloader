@@ -318,3 +318,69 @@ def test_playlist_cancel_skips_all_items(monkeypatch):
         statuses = c.execute('SELECT status FROM playlist_items WHERE job_id=?',(job_id,)).fetchall()
     assert job['status'] == 'canceled'
     assert [x['status'] for x in statuses] == ['canceled','canceled']
+
+def test_error_codes_distinguish_real_file_size_and_full_disk():
+    assert main.failure_code('ERROR: File is larger than max-filesize') == 'TOO_LARGE'
+    assert main.failure_code('ERROR: [Errno 28] No space left on device') == 'NO_SPACE'
+
+
+def test_scratch_files_can_exceed_output_limit(monkeypatch):
+    import hashlib, json, uuid
+    job_id = uuid.uuid4().hex
+    profile = {'kind':'video', 'ext':'MP4', 'height':720, 'label':'720p'}
+    main.init_db()
+    with main.db() as conn:
+        conn.execute("""INSERT INTO jobs(id,token_hash,url,title,profile,metadata,publish,source,
+            status,stage,percent,created) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (job_id,hashlib.sha256(b'token').hexdigest(),
+             'https://www.youtube.com/watch?v=aqz-KE-bpKQ','Teste',json.dumps(profile),
+             0,0,'YouTube','running','Obtendo',None,main.epoch()))
+        row=conn.execute('SELECT * FROM jobs WHERE id=?',(job_id,)).fetchone()
+    monkeypatch.setattr(main,'MAX_BYTES',100)
+    monkeypatch.setattr(main,'MAX_TEMP_BYTES',1024)
+    class Fake:
+        pid=999999
+        def __init__(self,_command,**kwargs):
+            folder=Path(kwargs['cwd'])
+            (folder/'media.mp4').write_bytes(b'x'*50)
+            (folder/'media.webm').write_bytes(b'w'*180)
+            (folder/'media.m4a').write_bytes(b'a'*120)
+            self.stdout=iter(['[Merger]'])
+        def poll(self): return 0
+        def wait(self): return 0
+    monkeypatch.setattr(main.subprocess,'Popen',Fake)
+    main.execute_job(row)
+    with main.db() as conn:
+        result=conn.execute('SELECT status,error_code,filesize FROM jobs WHERE id=?',(job_id,)).fetchone()
+    assert result['status']=='completed', result['error_code']
+    assert result['filesize']==50
+    assert [p.name for p in (main.WORK/job_id).iterdir()]==['media.mp4']
+
+
+def test_actual_oversized_output_still_fails(monkeypatch):
+    import hashlib, json, uuid
+    job_id = uuid.uuid4().hex
+    profile = {'kind':'video', 'ext':'MP4', 'height':720, 'label':'720p'}
+    main.init_db()
+    with main.db() as conn:
+        conn.execute("""INSERT INTO jobs(id,token_hash,url,title,profile,metadata,publish,source,
+            status,stage,percent,created) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (job_id,hashlib.sha256(b'token').hexdigest(),
+             'https://www.youtube.com/watch?v=aqz-KE-bpKQ','Teste',json.dumps(profile),
+             0,0,'YouTube','running','Obtendo',None,main.epoch()))
+        row=conn.execute('SELECT * FROM jobs WHERE id=?',(job_id,)).fetchone()
+    monkeypatch.setattr(main,'MAX_BYTES',100)
+    monkeypatch.setattr(main,'MAX_TEMP_BYTES',1024)
+    class Fake:
+        pid=999999
+        def __init__(self,_command,**kwargs):
+            (Path(kwargs['cwd'])/'media.mp4').write_bytes(b'x'*125)
+            self.stdout=iter(['[Merger]'])
+        def poll(self): return 0
+        def wait(self): return 0
+    monkeypatch.setattr(main.subprocess,'Popen',Fake)
+    main.execute_job(row)
+    with main.db() as conn:
+        result=conn.execute('SELECT status,error_code FROM jobs WHERE id=?',(job_id,)).fetchone()
+    assert result['status']=='failed'
+    assert result['error_code']=='TOO_LARGE'
