@@ -1,0 +1,558 @@
+"""API, SQLite and single-worker media queue for a self-hosted public downloader."""
+from __future__ import annotations
+
+import asyncio
+import hashlib
+import hmac
+import json
+import os
+import re
+import secrets
+import shutil
+import signal
+import sqlite3
+import subprocess
+import sys
+import threading
+import time
+import uuid
+from collections import defaultdict, deque
+from contextlib import contextmanager
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+from urllib.parse import urlparse, parse_qs
+
+from fastapi import FastAPI, HTTPException, Request, Header
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel, Field
+
+DATA = Path(os.getenv('DATA_DIR', '/data')).resolve()
+WORK = DATA / 'jobs'
+WEB = Path(__file__).resolve().parents[1] / 'web'
+DB_PATH = DATA / 'app.sqlite3'
+MAX_BYTES = int(os.getenv('MAX_FILE_MB', '1024')) * 1024 * 1024
+MAX_DURATION = int(os.getenv('MAX_DURATION_SECONDS', '5400'))
+EXPIRES_SECONDS = int(os.getenv('FILE_TTL_SECONDS', '7200'))
+INSPECT_TTL = 1800
+INSPECT_TIMEOUT = 45
+JOB_TIMEOUT = int(os.getenv('JOB_TIMEOUT_SECONDS', '2700'))
+MAX_QUEUE = 10
+MAX_INSPECT_CONCURRENT = 2
+HOST = os.getenv('PUBLIC_HOST', 'yt.ulln.com.br')
+APP_VERSION = '0.1.0'
+
+DATA.mkdir(parents=True, exist_ok=True)
+WORK.mkdir(parents=True, exist_ok=True)
+lock = threading.RLock()
+inspect_slots = threading.BoundedSemaphore(MAX_INSPECT_CONCURRENT)
+runner_started = False
+processes: dict[str, subprocess.Popen] = {}
+rate: dict[str, deque[float]] = defaultdict(deque)
+app = FastAPI(title='yt-downloader', version=APP_VERSION, docs_url=None, redoc_url=None, openapi_url=None)
+
+
+def utc() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def epoch() -> int:
+    return int(time.time())
+
+
+@contextmanager
+def db():
+    with lock:
+        conn = sqlite3.connect(DB_PATH, timeout=20, check_same_thread=False)
+        conn.row_factory = sqlite3.Row
+        try:
+            yield conn
+            conn.commit()
+        finally:
+            conn.close()
+
+
+def init_db() -> None:
+    with db() as c:
+        c.executescript('''
+        PRAGMA journal_mode=WAL;
+        CREATE TABLE IF NOT EXISTS inspections (
+          id TEXT PRIMARY KEY, url TEXT NOT NULL, metadata TEXT NOT NULL,
+          created INTEGER NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS jobs (
+          id TEXT PRIMARY KEY, token_hash TEXT NOT NULL, url TEXT NOT NULL,
+          title TEXT NOT NULL, profile TEXT NOT NULL, metadata INTEGER NOT NULL,
+          publish INTEGER NOT NULL, source TEXT NOT NULL, status TEXT NOT NULL,
+          stage TEXT NOT NULL, percent REAL, error_code TEXT, filename TEXT,
+          filesize INTEGER, created INTEGER NOT NULL, completed INTEGER,
+          expires INTEGER, cancel_requested INTEGER DEFAULT 0
+        );
+        CREATE TABLE IF NOT EXISTS public_history (
+          id TEXT PRIMARY KEY, title TEXT NOT NULL, url TEXT NOT NULL,
+          source TEXT NOT NULL, profile TEXT NOT NULL, created INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status,created);
+        CREATE INDEX IF NOT EXISTS idx_history_created ON public_history(created);
+        ''')
+        # A restarted download cannot be resumed mid-FFmpeg without a fresh job.
+        c.execute("UPDATE jobs SET status='failed', stage='Falha', error_code='INTERRUPTED' WHERE status='running'")
+
+
+class InspectBody(BaseModel):
+    url: str = Field(min_length=1, max_length=2000)
+
+
+class DownloadBody(BaseModel):
+    inspectionId: str
+    profileId: str
+    metadata: bool = True
+    publish: bool = False
+
+
+MESSAGES = {
+    'INVALID_URL': 'Confira o endereço do vídeo e tente novamente.',
+    'UNSUPPORTED': 'Use um link do YouTube ou Vimeo.',
+    'NOT_FOUND': 'Não conseguimos encontrar esse vídeo.',
+    'PRIVATE': 'Não foi possível acessar este vídeo. Verifique as permissões.',
+    'UNAVAILABLE': 'Este vídeo não está disponível para download.',
+    'FORMATS': 'Nenhum formato compatível foi encontrado.',
+    'TOO_LONG': 'O vídeo excede a duração permitida.',
+    'TOO_LARGE': 'O arquivo excede o tamanho permitido.',
+    'TIMED_OUT': 'A operação demorou demais. Tente novamente.',
+    'BUSY': 'Há muitas solicitações agora. Tente novamente em instantes.',
+    'INSPECTION_EXPIRED': 'Esta análise expirou. Analise o link novamente.',
+    'INVALID_PROFILE': 'Esta qualidade não está disponível. Analise o link novamente.',
+    'PROCESSING': 'Não foi possível preparar o arquivo. Tente outro formato.',
+    'CANCELED': 'Processamento cancelado.',
+    'INTERRUPTED': 'O servidor reiniciou durante o processamento. Tente novamente.',
+    'EXPIRED': 'Este arquivo expirou. Prepare-o novamente.',
+}
+
+
+def api_error(code: str, status: int = 400) -> HTTPException:
+    return HTTPException(status_code=status, detail={'code': code, 'message': MESSAGES.get(code, MESSAGES['PROCESSING'])})
+
+
+@app.exception_handler(HTTPException)
+async def http_error(_request: Request, exc: HTTPException):
+    if isinstance(exc.detail, dict) and 'code' in exc.detail:
+        return JSONResponse(exc.detail, status_code=exc.status_code, headers={'Cache-Control': 'no-store'})
+    return JSONResponse({'code': 'NOT_FOUND', 'message': 'Endereço não encontrado.'}, status_code=exc.status_code)
+
+
+@app.middleware('http')
+async def response_headers(request: Request, call_next):
+    response = await call_next(request)
+    response.headers['X-Content-Type-Options'] = 'nosniff'
+    response.headers['Referrer-Policy'] = 'no-referrer'
+    response.headers['X-Frame-Options'] = 'DENY'
+    response.headers['Cache-Control'] = 'no-store' if request.url.path.startswith('/api/') else 'public, max-age=300'
+    response.headers['Content-Security-Policy'] = "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' https: data:; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'"
+    return response
+
+
+def normalized_url(value: str) -> tuple[str, str]:
+    try:
+        u = urlparse(value.strip())
+        if u.scheme != 'https' or u.username or u.password or u.port or u.fragment:
+            raise ValueError
+        host = (u.hostname or '').lower().rstrip('.')
+        if host in ('youtube.com', 'www.youtube.com', 'm.youtube.com', 'music.youtube.com'):
+            if u.path == '/watch':
+                video_id = parse_qs(u.query).get('v', [''])[0]
+            else:
+                match = re.fullmatch(r'/(?:shorts|live|embed)/([\w-]{11})/?', u.path)
+                video_id = match.group(1) if match else ''
+            if not re.fullmatch(r'[\w-]{11}', video_id):
+                raise ValueError
+            return f'https://www.youtube.com/watch?v={video_id}', 'YouTube'
+        if host in ('youtu.be', 'www.youtu.be'):
+            match = re.fullmatch(r'/([\w-]{11})/?', u.path)
+            if not match:
+                raise ValueError
+            return f'https://www.youtube.com/watch?v={match.group(1)}', 'YouTube'
+        if host in ('vimeo.com', 'www.vimeo.com', 'player.vimeo.com'):
+            match = re.fullmatch(r'/(?:video/)?(\d{1,15})/?', u.path)
+            if not match:
+                raise ValueError
+            return f'https://vimeo.com/{match.group(1)}', 'Vimeo'
+        raise api_error('UNSUPPORTED')
+    except HTTPException:
+        raise
+    except (ValueError, TypeError):
+        raise api_error('INVALID_URL')
+
+
+def profiles_from(info: dict[str, Any]) -> list[dict[str, Any]]:
+    formats = info.get('formats') or []
+    heights: set[int] = set()
+    has_audio = False
+    for f in formats:
+        if not isinstance(f, dict):
+            continue
+        if f.get('acodec') not in (None, 'none'):
+            has_audio = True
+        h = f.get('height')
+        if f.get('vcodec') not in (None, 'none') and isinstance(h, (float, int)) and 144 <= int(h) <= 2160:
+            heights.add(int(h))
+    candidates = [2160, 1440, 1080, 720, 480, 360, 240, 144]
+    result = []
+    for h in candidates:
+        if h in heights:
+            result.append({'id': f'video-mp4-{h}', 'kind': 'video', 'ext': 'MP4', 'label': f'{h}p', 'height': h})
+    if has_audio:
+        result += [
+            {'id': 'audio-m4a-best', 'kind': 'audio', 'ext': 'M4A', 'label': 'Melhor disponível'},
+            {'id': 'audio-mp3-192', 'kind': 'audio', 'ext': 'MP3', 'label': '192 kbps'},
+            {'id': 'audio-mp3-128', 'kind': 'audio', 'ext': 'MP3', 'label': '128 kbps'},
+        ]
+    return result
+
+
+def failure_code(stderr: str) -> str:
+    s = stderr.lower()
+    if any(v in s for v in ('private video', 'private video.', 'permission', 'login required', 'sign in')):
+        return 'PRIVATE'
+    if any(v in s for v in ('not available', 'unavailable', 'copyright', 'geo-restricted', 'forbidden', 'unsupported url')):
+        return 'UNAVAILABLE'
+    if any(v in s for v in ('not found', '404', 'does not exist', 'video has been removed')):
+        return 'NOT_FOUND'
+    if any(v in s for v in ('requested format is not available', 'no video formats found')):
+        return 'FORMATS'
+    return 'PROCESSING'
+
+
+def inspect_media(url: str) -> dict[str, Any]:
+    command = [sys.executable, '-m', 'yt_dlp', '--ignore-config', '--no-playlist',
+               '--skip-download', '--dump-single-json', '--no-warnings',
+               '--socket-timeout', '12', '--retries', '1', url]
+    try:
+        done = subprocess.run(command, capture_output=True, text=True, timeout=INSPECT_TIMEOUT, check=False)
+    except subprocess.TimeoutExpired:
+        raise api_error('TIMED_OUT', 504)
+    if done.returncode != 0:
+        raise api_error(failure_code(done.stderr), 422)
+    try:
+        info = json.loads(done.stdout)
+    except (ValueError, TypeError):
+        raise api_error('UNAVAILABLE', 422)
+    if info.get('_type') in ('playlist', 'multi_video') or info.get('is_live') or info.get('live_status') in ('is_live', 'is_upcoming'):
+        raise api_error('UNAVAILABLE', 422)
+    duration = info.get('duration')
+    if not isinstance(duration, (int, float)) or duration <= 0:
+        raise api_error('UNAVAILABLE', 422)
+    if duration > MAX_DURATION:
+        raise api_error('TOO_LONG', 413)
+    profiles = profiles_from(info)
+    if not profiles:
+        raise api_error('FORMATS', 422)
+    thumbnail = str(info.get('thumbnail') or '')
+    if not thumbnail.startswith('https://'):
+        thumbnail = ''
+    return {'title': str(info.get('title') or 'Vídeo')[:300],
+            'author': str(info.get('uploader') or info.get('channel') or '')[:200],
+            'duration': int(duration), 'thumbnail': thumbnail,
+            'profiles': profiles}
+
+
+def client_key(request: Request) -> str:
+    # An anonymous ephemeral key; never persisted, never shown in history.
+    remote = request.headers.get('cf-connecting-ip') if os.getenv('TRUST_CF_IP') == '1' else None
+    remote = remote or (request.client.host if request.client else 'unknown')
+    return hashlib.sha256(remote.encode()).hexdigest()
+
+
+def allow_rate(request: Request, maximum: int, window: int) -> None:
+    with lock:
+        key = f'{client_key(request)}:{request.url.path}'
+        q = rate[key]
+        now = time.monotonic()
+        while q and now - q[0] > window:
+            q.popleft()
+        if len(q) >= maximum:
+            raise api_error('BUSY', 429)
+        q.append(now)
+        if len(rate) > 5000:
+            rate.clear()
+
+
+@app.get('/api/health')
+def health():
+    return {'status': 'ok', 'version': APP_VERSION}
+
+
+@app.post('/api/inspect')
+def inspect(body: InspectBody, request: Request):
+    allow_rate(request, 12, 600)
+    url, source = normalized_url(body.url)
+    if not inspect_slots.acquire(blocking=False):
+        raise api_error('BUSY', 429)
+    try:
+        info = inspect_media(url)
+    finally:
+        inspect_slots.release()
+    inspection_id = uuid.uuid4().hex
+    with db() as c:
+        c.execute('INSERT INTO inspections VALUES(?,?,?,?)', (inspection_id, url, json.dumps({'source': source, **info}), epoch()))
+    return {'inspectionId': inspection_id, 'source': source, **info}
+
+
+def public_job(row: sqlite3.Row) -> dict[str, Any]:
+    return {'id': row['id'], 'status': row['status'], 'stage': row['stage'],
+            'percent': round(row['percent'], 1) if row['percent'] is not None else None,
+            'error': {'code': row['error_code'], 'message': MESSAGES.get(row['error_code'], MESSAGES['PROCESSING'])} if row['error_code'] else None,
+            'fileName': row['filename'] if row['status'] == 'completed' else None,
+            'fileSize': row['filesize'] if row['status'] == 'completed' else None,
+            'expiresAt': row['expires'] if row['status'] == 'completed' else None}
+
+
+def require_job(job_id: str, token: str) -> sqlite3.Row:
+    with db() as c:
+        row = c.execute('SELECT * FROM jobs WHERE id=?', (job_id,)).fetchone()
+    if not row or not token or not hmac.compare_digest(row['token_hash'], hashlib.sha256(token.encode()).hexdigest()):
+        raise HTTPException(404)
+    return row
+
+
+@app.post('/api/downloads', status_code=202)
+def download(body: DownloadBody, request: Request):
+    allow_rate(request, 6, 600)
+    with db() as c:
+        inspection = c.execute('SELECT * FROM inspections WHERE id=?', (body.inspectionId,)).fetchone()
+        if not inspection or epoch() - inspection['created'] > INSPECT_TTL:
+            raise api_error('INSPECTION_EXPIRED', 410)
+        info = json.loads(inspection['metadata'])
+        profile = next((p for p in info['profiles'] if p['id'] == body.profileId), None)
+        if not profile:
+            raise api_error('INVALID_PROFILE', 422)
+        pending = c.execute("SELECT count(*) FROM jobs WHERE status IN ('queued','running')").fetchone()[0]
+        if pending >= MAX_QUEUE:
+            raise api_error('BUSY', 429)
+        job_id, token = uuid.uuid4().hex, secrets.token_urlsafe(32)
+        c.execute('''INSERT INTO jobs
+          (id,token_hash,url,title,profile,metadata,publish,source,status,stage,percent,created)
+          VALUES(?,?,?,?,?,?,?,?,?,?,?,?)''',
+          (job_id, hashlib.sha256(token.encode()).hexdigest(), inspection['url'], info['title'],
+           json.dumps(profile), int(body.metadata), int(body.publish), info['source'], 'queued', 'Na fila', None, epoch()))
+    return {'id': job_id, 'token': token, 'status': 'queued'}
+
+
+@app.get('/api/downloads/{job_id}')
+def status(job_id: str, token: str = ''):
+    return public_job(require_job(job_id, token))
+
+
+@app.get('/api/downloads/{job_id}/events')
+async def events(job_id: str, token: str = ''):
+    require_job(job_id, token)
+    async def stream():
+        last = None
+        for _ in range(4800):  # maximum open SSE lifetime ~40 minutes
+            row = require_job(job_id, token)
+            state = public_job(row)
+            serialized = json.dumps(state, ensure_ascii=False)
+            if serialized != last:
+                yield f'data: {serialized}\n\n'
+                last = serialized
+            else:
+                yield ': ping\n\n'
+            if state['status'] in ('completed', 'failed', 'canceled', 'expired'):
+                return
+            await asyncio.sleep(.5)
+    return StreamingResponse(stream(), media_type='text/event-stream', headers={'Cache-Control': 'no-store', 'X-Accel-Buffering': 'no'})
+
+
+@app.post('/api/downloads/{job_id}/cancel')
+def cancel(job_id: str, token: str = ''):
+    row = require_job(job_id, token)
+    if row['status'] in ('completed', 'failed', 'expired', 'canceled'):
+        return public_job(row)
+    with db() as c:
+        c.execute('UPDATE jobs SET cancel_requested=1 WHERE id=?', (job_id,))
+        if row['status'] == 'queued':
+            c.execute("UPDATE jobs SET status='canceled', stage='Cancelado', error_code='CANCELED' WHERE id=?", (job_id,))
+    with lock:
+        proc = processes.get(job_id)
+        if proc and proc.poll() is None:
+            os.killpg(proc.pid, signal.SIGTERM)
+    return {'status': 'canceling'}
+
+
+def safe_filename(title: str, ext: str) -> str:
+    cleaned = re.sub(r'[^\w\- .()]', '', title, flags=re.UNICODE).strip(' .')[:110]
+    return f'{cleaned or "arquivo"}.{ext.lower()}'
+
+
+@app.get('/api/downloads/{job_id}/file')
+def file(job_id: str, token: str = ''):
+    row = require_job(job_id, token)
+    if row['status'] != 'completed' or not row['expires'] or epoch() > row['expires']:
+        raise api_error('EXPIRED', 410)
+    paths = [p for p in (WORK / job_id).iterdir() if p.is_file() and p.name.startswith('media.') and p.suffix.lower() in ('.mp4', '.mp3', '.m4a')]
+    if not paths:
+        raise api_error('EXPIRED', 410)
+    mime = {'.mp4': 'video/mp4', '.mp3': 'audio/mpeg', '.m4a': 'audio/mp4'}[paths[0].suffix.lower()]
+    response = FileResponse(paths[0], media_type=mime, filename=row['filename'])
+    response.headers['Cache-Control'] = 'private, no-store'
+    return response
+
+
+@app.get('/api/history')
+def history(limit: int = 30, offset: int = 0):
+    limit = min(max(1, limit), 50)
+    offset = min(max(0, offset), 10000)
+    with db() as c:
+        rows = c.execute('SELECT title,url,source,profile,created FROM public_history ORDER BY created DESC LIMIT ? OFFSET ?', (limit, offset)).fetchall()
+    return {'items': [{'title': r['title'], 'url': r['url'], 'source': r['source'],
+                       'profile': json.loads(r['profile']), 'createdAt': r['created']} for r in rows]}
+
+
+def set_job(job_id: str, **fields):
+    if not fields:
+        return
+    with db() as c:
+        c.execute('UPDATE jobs SET '+','.join(f'{k}=?' for k in fields)+' WHERE id=?', (*fields.values(), job_id))
+
+
+def execute_job(row: sqlite3.Row) -> None:
+    job_id = row['id']
+    folder = WORK / job_id
+    folder.mkdir(mode=0o700, parents=True, exist_ok=True)
+    profile = json.loads(row['profile'])
+    kind, ext = profile['kind'], profile['ext'].lower()
+    command = [sys.executable, '-m', 'yt_dlp', '--ignore-config', '--no-playlist', '--no-warnings',
+               '--newline', '--socket-timeout', '15', '--retries', '2', '--fragment-retries', '2',
+               '--max-filesize', str(MAX_BYTES), '--progress-template',
+               'download:DL:%(progress._percent_str)s|%(progress.downloaded_bytes)s|%(progress.total_bytes)s|%(progress.total_bytes_estimate)s',
+               '--output', str(folder / 'media.%(ext)s')]
+    if kind == 'video':
+        h = int(profile['height'])
+        command += ['--format', f'bv*[height<={h}]+ba/b[height<={h}]', '--merge-output-format', 'mp4', '--recode-video', 'mp4']
+    else:
+        command += ['--format', 'bestaudio/best', '--extract-audio', '--audio-format', ext]
+        if ext == 'mp3':
+            command += ['--audio-quality', profile['label'].split()[0] + 'K']
+    if row['metadata']:
+        command += ['--embed-metadata', '--embed-thumbnail']
+    command += [row['url']]
+    set_job(job_id, status='running', stage='Obtendo arquivo', percent=None)
+    proc = None
+    deadline = time.monotonic() + JOB_TIMEOUT
+    last_output = ''
+    try:
+        proc = subprocess.Popen(command, cwd=str(folder), stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                text=True, errors='replace', bufsize=1, start_new_session=True)
+        with lock:
+            processes[job_id] = proc
+        assert proc.stdout is not None
+        # The parent runs a watchdog so cancellation/timeout applies while output is quiet.
+        def watchdog():
+            while proc.poll() is None:
+                with db() as c:
+                    state = c.execute('SELECT cancel_requested FROM jobs WHERE id=?', (job_id,)).fetchone()
+                if (state and state['cancel_requested']) or time.monotonic() >= deadline or folder_size(folder) >= MAX_BYTES:
+                    try:
+                        os.killpg(proc.pid, signal.SIGTERM)
+                    except ProcessLookupError:
+                        pass
+                    return
+                time.sleep(1)
+        watcher = threading.Thread(target=watchdog, daemon=True)
+        watcher.start()
+        for line in proc.stdout:
+            line = line.strip()
+            last_output = (last_output + '\n' + line)[-7000:]
+            if 'DL:' in line:
+                match = re.search(r'DL:\s*([\d.,]+)%', line)
+                pct = float(match.group(1).replace(',', '.')) if match else None
+                if pct is not None:
+                    set_job(job_id, stage='Obtendo arquivo', percent=min(99, max(0, pct)))
+            elif any(s in line for s in ('[Merger]', '[VideoConvertor]', '[ExtractAudio]', '[Fixup')):
+                set_job(job_id, stage='Convertendo arquivo', percent=None)
+            elif any(s in line for s in ('[Metadata]', '[EmbedThumbnail]')):
+                set_job(job_id, stage='Adicionando metadados', percent=None)
+        rc = proc.wait()
+        with db() as c:
+            canceled = c.execute('SELECT cancel_requested FROM jobs WHERE id=?', (job_id,)).fetchone()['cancel_requested']
+        if canceled:
+            raise RuntimeError('CANCELED')
+        if time.monotonic() >= deadline:
+            raise RuntimeError('TIMED_OUT')
+        if folder_size(folder) >= MAX_BYTES:
+            raise RuntimeError('TOO_LARGE')
+        if rc != 0:
+            raise RuntimeError(failure_code(last_output))
+        results = [p for p in folder.iterdir() if p.is_file() and p.suffix.lower() == '.' + ext]
+        if not results:
+            raise RuntimeError('PROCESSING')
+        output = max(results, key=lambda p: p.stat().st_size)
+        final = folder / f'media.{ext}'
+        if output != final:
+            output.rename(final)
+        size = final.stat().st_size
+        if size > MAX_BYTES:
+            raise RuntimeError('TOO_LARGE')
+        filename = safe_filename(row['title'], ext)
+        finished = epoch()
+        with db() as c:
+            c.execute('''UPDATE jobs SET status='completed',stage='Concluído',percent=100,
+                         filename=?,filesize=?,completed=?,expires=? WHERE id=?''',
+                      (filename,size,finished,finished+EXPIRES_SECONDS,job_id))
+            if row['publish']:
+                c.execute('INSERT INTO public_history VALUES(?,?,?,?,?,?)',
+                          (uuid.uuid4().hex,row['title'],row['url'],row['source'],row['profile'],finished))
+    except Exception as exc:
+        code = str(exc) if str(exc) in MESSAGES else 'PROCESSING'
+        set_job(job_id, status='canceled' if code == 'CANCELED' else 'failed',
+                stage='Cancelado' if code == 'CANCELED' else 'Falha', percent=None,error_code=code)
+        shutil.rmtree(folder, ignore_errors=True)
+    finally:
+        with lock:
+            processes.pop(job_id, None)
+
+
+def folder_size(folder: Path) -> int:
+    try:
+        return sum(p.stat().st_size for p in folder.iterdir() if p.is_file())
+    except FileNotFoundError:
+        return 0
+
+
+def worker():
+    while True:
+        with db() as c:
+            job = c.execute("SELECT * FROM jobs WHERE status='queued' ORDER BY created,id LIMIT 1").fetchone()
+        if job:
+            execute_job(job)
+        else:
+            time.sleep(1)
+
+
+def cleanup():
+    while True:
+        now = epoch()
+        with db() as c:
+            rows = c.execute("SELECT id FROM jobs WHERE status='completed' AND expires <= ?", (now,)).fetchall()
+            for row in rows:
+                c.execute("UPDATE jobs SET status='expired',stage='Expirado',error_code='EXPIRED' WHERE id=?", (row['id'],))
+            c.execute('DELETE FROM inspections WHERE created < ?', (now - INSPECT_TTL,))
+            c.execute('DELETE FROM jobs WHERE created < ? AND status IN (\'expired\',\'failed\',\'canceled\')', (now - 86400 * 3,))
+        for row in rows:
+            shutil.rmtree(WORK / row['id'], ignore_errors=True)
+        time.sleep(60)
+
+
+@app.on_event('startup')
+def on_startup():
+    global runner_started
+    if runner_started:
+        return
+    init_db()
+    threading.Thread(target=worker, name='media-worker', daemon=True).start()
+    threading.Thread(target=cleanup, name='media-cleanup', daemon=True).start()
+    runner_started = True
+
+
+app.mount('/', StaticFiles(directory=str(WEB), html=True), name='web')
