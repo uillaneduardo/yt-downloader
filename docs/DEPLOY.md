@@ -58,13 +58,13 @@ Antes de exposição pública, configurar WAF/Rate Limiting na Cloudflare, revis
 | Variável | Padrão | Significado |
 |---|---|---|
 | `YT_PORT` | `8098` | Porta local da VM |
-| `MAX_FILE_MB` | `1024` | Tamanho máximo do arquivo final individual | 
-| `MAX_TEMP_MB` | `4096` | Espaço intermediário por vídeo em MB |
+| `MAX_FILE_MB` | `1024` | Limite do **arquivo final individual**, em MB |
+| `MAX_TEMP_MB` | `4096` | Teto de arquivos **intermediários** durante a conversão (por vídeo), em MB |
 | `MAX_DURATION_SECONDS` | `5400` | Duração limite de vídeo |
 | `FILE_TTL_SECONDS` | `7200` | Retenção do arquivo pronto |
 | `JOB_TIMEOUT_SECONDS` | `2700` | Tempo limite por processamento |
-| `MAX_PLAYLIST_TOTAL_MB` | `2048` | Limite do ZIP final de playlist em MB | 
-| `MAX_PLAYLIST_TEMP_MB` | `6144` | Espaço intermediário de playlist em MB | 
+| `MAX_PLAYLIST_TOTAL_MB` | `2048` | Limite do ZIP final de uma playlist, em MB |
+| `MAX_PLAYLIST_TEMP_MB` | `6144` | Espaço temporário máximo para uma playlist durante processamento/compactação, em MB |
 | `TRUST_CF_IP` | `0` | Use `1` somente se o tunnel for a única entrada HTTP (porta bindada em loopback no host). O backend valida o IP recebido do cabeçalho; no container, o peer pode ser o gateway Docker |
 
 ## Homologação manual
@@ -96,25 +96,51 @@ curl -fsS http://127.0.0.1:8098/api/health
 
 A aplicação aceita URLs `https://www.youtube.com/playlist?list=...`, limita a 20 itens inicialmente, baixa sequencialmente e entrega um arquivo ZIP. Não publica playlists no histórico. Garanta espaço em disco adicional durante a montagem do ZIP. Se um vídeo individual falhar, os demais continuam. Para homologar, teste uma playlist pública de 2 a 3 vídeos curtos, selecione MP4/MP3, confira a ordem no ZIP e teste cancelamento.
 
-## Solução do erro de tamanho (v0.2.1)
 
-Antes, o backend comparava a soma do vídeo, áudio e arquivos de conversão com
-`MAX_FILE_MB`. Isso podia recusar um vídeo final que cabia no limite. Agora,
-o limite final é separado dos intermediários (variável `MAX_TEMP_MB`), sem
-desativar a proteção de espaço.
+## Mensagem “O arquivo excede o tamanho permitido” (v0.2.1)
 
-Atualização na branch de playlists, mantendo o volume e o banco existentes:
+O limite `MAX_FILE_MB` se aplica **somente ao arquivo final**, não à soma do vídeo,
+áudio e arquivos de conversão. Versões anteriores verificavam a soma dos intermediários
+e podiam abortar um vídeo válido com um falso erro de tamanho. Esta versão reserva uma
+quota separada para esses intermediários (`MAX_TEMP_MB`), mas mantém a verificação
+real do arquivo final. Para playlists, também distingue o tamanho do ZIP final
+(`MAX_PLAYLIST_TOTAL_MB`) do espaço temporário (`MAX_PLAYLIST_TEMP_MB`).
+
+Para atualizar um checkout que acompanha o PR de playlists:
 
 ```bash
 cd ~/homelab/apps/yt-downloader
 git fetch origin
 git switch --detach origin/feat/youtube-playlists-sequential
+# O .env existente não é substituído; adicione/ajuste os limites somente se necessário.
 sudo docker compose up -d --build
 sudo docker compose ps
 curl -fsS http://127.0.0.1:8098/api/health
 ```
 
-O health check deve indicar `version: 0.2.1`. Caso continue exibindo o erro,
-veja `MAX_FILE_MB` em seu `.env`, confira `df -h .` no servidor e tente
-uma resolução inferior. Um arquivo final realmente acima do limite continua
-sendo recusado. O volume deve comportar os arquivos intermediários.
+O health check deve retornar `version: 0.2.1`. Para conferência do limite em execução:
+
+```bash
+sudo docker compose exec yt-downloader sh -c 'printf "Arquivo=%s MB; Temporário=%s MB\n" "$MAX_FILE_MB" "$MAX_TEMP_MB"'
+df -h .
+sudo docker compose logs --tail=80 yt-downloader
+```
+
+Se o arquivo final realmente ultrapassar `MAX_FILE_MB`, escolha uma qualidade inferior
+ou altere o limite no `.env` conscientemente. Não aumente as quotas sem verificar a
+capacidade do volume `./data`, pois conversão e montagem de ZIP consomem espaço
+adicional. A correção **não garante** que vídeos indisponíveis sejam baixados.
+
+
+### Habilitar a administração
+
+No `.env`, defina `ADMIN_PASSWORD` (gere com `openssl rand -hex 24`), `IP_RETENTION_DAYS=7`, `JOB_RETENTION_DAYS=30` e mantenha `TRUST_CF_IP=1` **apenas** quando a conexão direta estiver bloqueada e a única entrada for o túnel Cloudflare.
+
+```bash
+cd ~/homelab/apps/yt-downloader
+grep -q '^ADMIN_PASSWORD=' .env || printf 'ADMIN_PASSWORD=%s\n' "$(openssl rand -hex 24)" >> .env
+sudo docker compose up -d --build
+curl -fsS http://127.0.0.1:8098/api/health
+```
+
+Abra `https://yt.ulln.com.br/admin`. A senha fica no `.env` do servidor; não a inclua no repositório. Configure Cloudflare Access para restringir `/admin` e, preferencialmente, `/api/admin/*`. A interface usa cookies HttpOnly e tokens CSRF.

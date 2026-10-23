@@ -36,7 +36,8 @@ WEB = Path(__file__).resolve().parents[1] / 'web'
 DB_PATH = DATA / 'app.sqlite3'
 MAX_FILE_MB = max(1, int(os.getenv('MAX_FILE_MB', '1024')))
 MAX_BYTES = MAX_FILE_MB * 1024 * 1024
-# Video, audio and conversion output may coexist temporarily.
+# Encoding and muxing can temporarily retain both streams and the final file.
+# Do not compare the sum of intermediate files against the final output limit.
 MAX_TEMP_MB = max(MAX_FILE_MB, int(os.getenv('MAX_TEMP_MB', str(max(4096, 4 * MAX_FILE_MB)))))
 MAX_TEMP_BYTES = MAX_TEMP_MB * 1024 * 1024
 MAX_DURATION = int(os.getenv('MAX_DURATION_SECONDS', '5400'))
@@ -48,13 +49,15 @@ MAX_QUEUE = 10
 MAX_PLAYLIST_ITEMS = max(1, min(50, int(os.getenv('MAX_PLAYLIST_ITEMS', '20'))))
 MAX_PLAYLIST_TOTAL_MB = max(1, int(os.getenv('MAX_PLAYLIST_TOTAL_MB', '2048')))
 MAX_PLAYLIST_TOTAL_BYTES = MAX_PLAYLIST_TOTAL_MB * 1024 * 1024
-# ZIP creation may temporarily duplicate all of the completed videos.
+# ZIP packaging temporarily duplicates the retained videos; allow working space.
 MAX_PLAYLIST_TEMP_MB = max(MAX_PLAYLIST_TOTAL_MB * 2, int(os.getenv('MAX_PLAYLIST_TEMP_MB', str(max(6144, 3 * MAX_PLAYLIST_TOTAL_MB)))))
 MAX_PLAYLIST_TEMP_BYTES = MAX_PLAYLIST_TEMP_MB * 1024 * 1024
 PLAYLIST_INSPECT_TIMEOUT = 90
 MAX_INSPECT_CONCURRENT = 2
 HOST = os.getenv('PUBLIC_HOST', 'yt.ulln.com.br')
-APP_VERSION = '0.2.1'
+IP_RETENTION_DAYS = max(1,min(30,int(os.getenv('IP_RETENTION_DAYS','7'))))
+JOB_RETENTION_DAYS = max(7,min(365,int(os.getenv('JOB_RETENTION_DAYS','30'))))
+APP_VERSION = '0.3.0'
 
 DATA.mkdir(parents=True, exist_ok=True)
 WORK.mkdir(parents=True, exist_ok=True)
@@ -124,6 +127,7 @@ def init_db() -> None:
             c.execute("ALTER TABLE jobs ADD COLUMN kind TEXT NOT NULL DEFAULT 'single'")
         # A restarted download cannot be resumed mid-FFmpeg without a fresh job.
         c.execute("UPDATE jobs SET status='failed', stage='Falha', error_code='INTERRUPTED' WHERE status='running'")
+    admin_schema()
 
 
 class InspectBody(BaseModel):
@@ -160,6 +164,8 @@ MESSAGES = {
     'PLAYLIST_LIMIT': 'A playlist ultrapassa o limite de vídeos. Use uma lista menor.',
     'PLAYLIST_EMPTY': 'Não encontramos vídeos públicos nesta playlist.',
     'PLAYLIST_FAILED': 'Nenhum vídeo da playlist pôde ser preparado.',
+    'ADMIN_DISABLED': 'A administração não está configurada.',
+    'UNAUTHORIZED': 'Acesso não autorizado.',
 }
 
 
@@ -256,6 +262,8 @@ def failure_code(stderr: str) -> str:
         return 'TOO_LARGE'
     if any(v in s for v in ('private video', 'private video.', 'permission', 'login required', 'sign in')):
         return 'PRIVATE'
+    if any(v in s for v in ('file is larger than', 'file is too large', 'exceeds max', 'max-filesize')):
+        return 'TOO_LARGE'
     if any(v in s for v in ('not available', 'unavailable', 'copyright', 'geo-restricted', 'forbidden', 'unsupported url')):
         return 'UNAVAILABLE'
     if any(v in s for v in ('not found', '404', 'does not exist', 'video has been removed')):
@@ -453,6 +461,7 @@ def download(body: DownloadBody, request: Request):
           (job_id, hashlib.sha256(token.encode()).hexdigest(), inspection['url'], info['title'],
            json.dumps(profile), int(body.metadata), int(body.publish), info['source'],
            'queued', 'Na fila', None, epoch(), kind))
+        c.execute('UPDATE jobs SET client_ip=? WHERE id=?', (admin_client_ip(request), job_id))
         if kind == 'playlist':
             for position, entry in enumerate(info['entries'], 1):
                 c.execute('''INSERT INTO playlist_items(job_id,position,video_id,title,url)
@@ -635,7 +644,7 @@ def execute_job(row: sqlite3.Row) -> None:
         size = final.stat().st_size
         if size > MAX_BYTES:
             raise RuntimeError('TOO_LARGE')
-        # Only the finished file should occupy storage after processing.
+        # Remove source streams/recode scratch so only the completed file remains.
         for temporary in folder.iterdir():
             if temporary.is_file() and temporary != final:
                 temporary.unlink(missing_ok=True)
@@ -848,10 +857,11 @@ def cleanup():
             for row in rows:
                 c.execute("UPDATE jobs SET status='expired',stage='Expirado',error_code='EXPIRED' WHERE id=?", (row['id'],))
             c.execute('DELETE FROM inspections WHERE created < ?', (now - INSPECT_TTL,))
-            c.execute('DELETE FROM playlist_items WHERE job_id IN (SELECT id FROM jobs WHERE created < ? AND status IN (\'expired\',\'failed\',\'canceled\'))', (now - 86400 * 3,))
-            c.execute('DELETE FROM jobs WHERE created < ? AND status IN (\'expired\',\'failed\',\'canceled\')', (now - 86400 * 3,))
+            c.execute('DELETE FROM playlist_items WHERE job_id IN (SELECT id FROM jobs WHERE created < ? AND status IN (\'expired\',\'failed\',\'canceled\'))', (now - 86400 * JOB_RETENTION_DAYS,))
+            c.execute('DELETE FROM jobs WHERE created < ? AND status IN (\'expired\',\'failed\',\'canceled\')', (now - 86400 * JOB_RETENTION_DAYS,))
         for row in rows:
             shutil.rmtree(WORK / row['id'], ignore_errors=True)
+        admin_privacy_cleanup()
         time.sleep(60)
 
 
@@ -865,5 +875,8 @@ def on_startup():
     threading.Thread(target=cleanup, name='media-cleanup', daemon=True).start()
     runner_started = True
 
+
+from .admin import install_admin
+install_admin(app, sys.modules[__name__])
 
 app.mount('/', StaticFiles(directory=str(WEB), html=True), name='web')

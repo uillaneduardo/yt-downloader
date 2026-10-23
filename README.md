@@ -67,14 +67,36 @@ O histórico público é **desativado para playlists**: a inspeção em modo pla
 
 Limites: `MAX_PLAYLIST_ITEMS=20`, `MAX_PLAYLIST_TOTAL_MB=2048` (espaço máximo para conteúdo/ZIP) e `JOB_TIMEOUT_SECONDS=2700` por vídeo. Para evitar sobrecarga em disco, configure o volume de dados com espaço suficiente para os vídeos **e o ZIP temporário**. Playlists enormes são recusadas na inspeção. Um download de ZIP grande pelo Cloudflare Tunnel pode depender dos limites do seu plano/infraestrutura; homologue com dois vídeos pequenos primeiro.
 
+
 ## Limites de armazenamento (v0.2.1)
 
-O arquivo final usa `MAX_FILE_MB` (1024 MB por padrão) e os arquivos intermediários
-usam `MAX_TEMP_MB` (4096 MB). São limites distintos: vídeo, áudio e saída de
-conversão podem coexistir enquanto o trabalho está em andamento, sem provocar um
-falso erro de tamanho. Intermediários são removidos ao concluir.
+O arquivo individual final usa `MAX_FILE_MB` (1024 MB por padrão); arquivos temporários
+para obtenção, mesclagem e conversão usam `MAX_TEMP_MB` (4096 MB). Esses são limites
+diferentes: o uso transitório de múltiplos arquivos não deve causar um falso erro de
+“arquivo grande”. Após a conclusão, apenas o arquivo final é retido.
 
-Para playlists, `MAX_PLAYLIST_TOTAL_MB` (2048 MB) limita o ZIP final e
-`MAX_PLAYLIST_TEMP_MB` (6144 MB) reserva o espaço de trabalho para processar
-a playlist e montar o ZIP. Verifique o espaço livre do volume `./data` antes
-de aumentar os limites. Mais detalhes em [docs/DEPLOY.md](docs/DEPLOY.md).
+Uma playlist usa `MAX_PLAYLIST_TOTAL_MB` (2048 MB para o ZIP final) e
+`MAX_PLAYLIST_TEMP_MB` (6144 MB para a operação temporária). Valores podem ser
+ajustados no `.env` do homelab e exigem rebuild/recriação do container. Garanta
+espaço livre correspondente no volume `./data`. Mensagens distinguem arquivo final
+maior que o permitido, falta de espaço físico e limite de trabalho temporário.
+
+Consulte [docs/DEPLOY.md](docs/DEPLOY.md) para atualização sem limpar os dados.
+
+
+## Painel administrativo (v0.3)
+
+- URL: `/admin` (ex.: `https://yt.ulln.com.br/admin`).
+- Defina `ADMIN_PASSWORD` com pelo menos **16 caracteres** em `.env`, e recrie o container: `sudo docker compose up -d --build`.
+- Se estiver vazio, as APIs administrativas permanecem desativadas (HTTP 503).
+- Sessão em cookie HttpOnly/SameSite Strict, controle CSRF e limitação de tentativas de login.
+- Visão geral: fila, falhas recentes, espaço ocupado e disponível.
+- Downloads: títulos, URL normalizada, perfil, situação, tamanho e IP (visível somente ao administrador).
+- Arquivos: ocupação por tarefa, remoção apenas de tarefas finalizadas, limpeza de expirados.
+- Limites: ajustes persistidos no SQLite, sem reconstruir imagem; entram em vigor imediatamente e podem afetar downloads em andamento.
+- IPs começam a ser registrados **após a atualização**. IPs antigos não podem ser recuperados retroativamente. IP retido inicialmente por 7 dias, com valor configurável entre 1 e 30; histórico operacional por 30 dias (7 a 365).
+- O histórico público continua exibindo apenas downloads publicados voluntariamente, sem IP.
+
+**Atenção:** IP é dado pessoal. Informe o uso no aviso de privacidade, restrinja `/admin` com Cloudflare Access além do login e evite divulgar os registros. Não ative `TRUST_CF_IP=1` se um visitante puder acessar o serviço diretamente e forjar o cabeçalho. O serviço deve continuar ligado em `127.0.0.1` no host.
+
+**Diagnóstico de limite persistente:** verifique no painel os limites `MAX_FILE_MB` e `MAX_TEMP_MB`, o espaço livre do volume e o erro da execução. Se o arquivo final exceder o limite selecionado, aumentar somente `MAX_TEMP_MB` não resolverá.
