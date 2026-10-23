@@ -17,6 +17,7 @@ import sys
 import threading
 import time
 import uuid
+import zipfile
 from collections import defaultdict, deque
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -40,9 +41,12 @@ INSPECT_TTL = 1800
 INSPECT_TIMEOUT = 45
 JOB_TIMEOUT = int(os.getenv('JOB_TIMEOUT_SECONDS', '2700'))
 MAX_QUEUE = 10
+MAX_PLAYLIST_ITEMS = max(1, min(50, int(os.getenv('MAX_PLAYLIST_ITEMS', '20'))))
+MAX_PLAYLIST_TOTAL_BYTES = int(os.getenv('MAX_PLAYLIST_TOTAL_MB', '2048')) * 1024 * 1024
+PLAYLIST_INSPECT_TIMEOUT = 90
 MAX_INSPECT_CONCURRENT = 2
 HOST = os.getenv('PUBLIC_HOST', 'yt.ulln.com.br')
-APP_VERSION = '0.1.0'
+APP_VERSION = '0.2.0'
 
 DATA.mkdir(parents=True, exist_ok=True)
 WORK.mkdir(parents=True, exist_ok=True)
@@ -88,15 +92,28 @@ def init_db() -> None:
           publish INTEGER NOT NULL, source TEXT NOT NULL, status TEXT NOT NULL,
           stage TEXT NOT NULL, percent REAL, error_code TEXT, filename TEXT,
           filesize INTEGER, created INTEGER NOT NULL, completed INTEGER,
-          expires INTEGER, cancel_requested INTEGER DEFAULT 0
+          expires INTEGER, cancel_requested INTEGER DEFAULT 0,
+          kind TEXT NOT NULL DEFAULT 'single'
         );
         CREATE TABLE IF NOT EXISTS public_history (
           id TEXT PRIMARY KEY, title TEXT NOT NULL, url TEXT NOT NULL,
           source TEXT NOT NULL, profile TEXT NOT NULL, created INTEGER NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS playlist_items (
+          job_id TEXT NOT NULL, position INTEGER NOT NULL, video_id TEXT NOT NULL,
+          title TEXT NOT NULL, url TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'queued',
+          stage TEXT NOT NULL DEFAULT 'Na fila', percent REAL,
+          error_code TEXT, filename TEXT, filesize INTEGER,
+          PRIMARY KEY(job_id, position)
+        );
+        CREATE INDEX IF NOT EXISTS idx_playlist_items_job ON playlist_items(job_id,position);
         CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status,created);
         CREATE INDEX IF NOT EXISTS idx_history_created ON public_history(created);
         ''')
+        # Preserve existing installations created before playlist support.
+        columns = {row['name'] for row in c.execute('PRAGMA table_info(jobs)')}
+        if 'kind' not in columns:
+            c.execute("ALTER TABLE jobs ADD COLUMN kind TEXT NOT NULL DEFAULT 'single'")
         # A restarted download cannot be resumed mid-FFmpeg without a fresh job.
         c.execute("UPDATE jobs SET status='failed', stage='Falha', error_code='INTERRUPTED' WHERE status='running'")
 
@@ -129,6 +146,9 @@ MESSAGES = {
     'CANCELED': 'Processamento cancelado.',
     'INTERRUPTED': 'O servidor reiniciou durante o processamento. Tente novamente.',
     'EXPIRED': 'Este arquivo expirou. Prepare-o novamente.',
+    'PLAYLIST_LIMIT': 'A playlist ultrapassa o limite de vídeos. Use uma lista menor.',
+    'PLAYLIST_EMPTY': 'Não encontramos vídeos públicos nesta playlist.',
+    'PLAYLIST_FAILED': 'Nenhum vídeo da playlist pôde ser preparado.',
 }
 
 
@@ -161,6 +181,11 @@ def normalized_url(value: str) -> tuple[str, str]:
             raise ValueError
         host = (u.hostname or '').lower().rstrip('.')
         if host in ('youtube.com', 'www.youtube.com', 'm.youtube.com', 'music.youtube.com'):
+            if u.path == '/playlist':
+                playlist_id = parse_qs(u.query).get('list', [''])[0]
+                if not re.fullmatch(r'[A-Za-z0-9_-]{10,100}', playlist_id):
+                    raise ValueError
+                return f'https://www.youtube.com/playlist?list={playlist_id}', 'YouTube'
             if u.path == '/watch':
                 video_id = parse_qs(u.query).get('v', [''])[0]
             else:
@@ -227,7 +252,7 @@ def failure_code(stderr: str) -> str:
 
 def inspect_media(url: str) -> dict[str, Any]:
     command = [sys.executable, '-m', 'yt_dlp', '--ignore-config', '--no-playlist',
-               '--skip-download', '--dump-single-json', '--no-warnings',
+               '--skip-download', '--dump-single-json', '--no-warnings', '--js-runtimes', 'node',
                '--socket-timeout', '12', '--retries', '1', url]
     try:
         done = subprocess.run(command, capture_output=True, text=True, timeout=INSPECT_TIMEOUT, check=False)
@@ -257,6 +282,56 @@ def inspect_media(url: str) -> dict[str, Any]:
             'author': str(info.get('uploader') or info.get('channel') or '')[:200],
             'duration': int(duration), 'thumbnail': thumbnail,
             'profiles': profiles}
+
+
+def inspect_playlist(url: str) -> dict[str, Any]:
+    """Fetch only bounded flat playlist entries; no media is downloaded here."""
+    command = [sys.executable, '-m', 'yt_dlp', '--ignore-config', '--flat-playlist',
+               '--playlist-end', str(MAX_PLAYLIST_ITEMS + 1), '--skip-download',
+               '--dump-single-json', '--no-warnings', '--js-runtimes', 'node',
+               '--socket-timeout', '12', '--retries', '1', url]
+    try:
+        done = subprocess.run(command, capture_output=True, text=True,
+                              timeout=PLAYLIST_INSPECT_TIMEOUT, check=False)
+    except subprocess.TimeoutExpired:
+        raise api_error('TIMED_OUT', 504)
+    if done.returncode != 0:
+        raise api_error(failure_code(done.stderr), 422)
+    try:
+        info = json.loads(done.stdout)
+    except (ValueError, TypeError):
+        raise api_error('UNAVAILABLE', 422)
+    if info.get('_type') != 'playlist':
+        raise api_error('UNAVAILABLE', 422)
+    entries = info.get('entries') or []
+    if len(entries) > MAX_PLAYLIST_ITEMS:
+        raise api_error('PLAYLIST_LIMIT', 413)
+    videos = []
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        video_id = str(entry.get('id') or '')
+        if not re.fullmatch(r'[A-Za-z0-9_-]{11}', video_id):
+            continue
+        videos.append({'id': video_id, 'title': str(entry.get('title') or f'Vídeo {len(videos)+1}')[:300],
+                       'url': f'https://www.youtube.com/watch?v={video_id}'})
+    if not videos:
+        raise api_error('PLAYLIST_EMPTY', 422)
+    profiles = [
+        {'id': f'video-mp4-{height}', 'kind': 'video', 'ext': 'MP4',
+         'label': f'Até {height}p', 'height': height}
+        for height in (1080, 720, 480)
+    ] + [
+        {'id': 'audio-m4a-best', 'kind': 'audio', 'ext': 'M4A', 'label': 'Melhor disponível'},
+        {'id': 'audio-mp3-192', 'kind': 'audio', 'ext': 'MP3', 'label': '192 kbps'},
+        {'id': 'audio-mp3-128', 'kind': 'audio', 'ext': 'MP3', 'label': '128 kbps'},
+    ]
+    return {'kind': 'playlist', 'title': str(info.get('title') or 'Playlist')[:300],
+            'author': str(info.get('uploader') or info.get('channel') or '')[:200],
+            'duration': None, 'thumbnail': f'https://i.ytimg.com/vi/{videos[0]["id"]}/hqdefault.jpg',
+            'profiles': profiles, 'entries': videos, 'count': len(videos),
+            # Flat listing does not prove that all entries are publicly listed.
+            'publicEligible': False}
 
 
 def client_key(request: Request) -> str:
@@ -299,7 +374,7 @@ def inspect(body: InspectBody, request: Request):
     if not inspect_slots.acquire(blocking=False):
         raise api_error('BUSY', 429)
     try:
-        info = inspect_media(url)
+        info = inspect_playlist(url) if '/playlist?list=' in url else inspect_media(url)
     finally:
         inspect_slots.release()
     inspection_id = uuid.uuid4().hex
@@ -309,12 +384,26 @@ def inspect(body: InspectBody, request: Request):
 
 
 def public_job(row: sqlite3.Row) -> dict[str, Any]:
-    return {'id': row['id'], 'status': row['status'], 'stage': row['stage'],
-            'percent': round(row['percent'], 1) if row['percent'] is not None else None,
-            'error': {'code': row['error_code'], 'message': MESSAGES.get(row['error_code'], MESSAGES['PROCESSING'])} if row['error_code'] else None,
-            'fileName': row['filename'] if row['status'] == 'completed' else None,
-            'fileSize': row['filesize'] if row['status'] == 'completed' else None,
-            'expiresAt': row['expires'] if row['status'] == 'completed' else None}
+    result = {'id': row['id'], 'status': row['status'], 'stage': row['stage'],
+              'percent': round(row['percent'], 1) if row['percent'] is not None else None,
+              'error': {'code': row['error_code'], 'message': MESSAGES.get(row['error_code'], MESSAGES['PROCESSING'])} if row['error_code'] else None,
+              'fileName': row['filename'] if row['status'] == 'completed' else None,
+              'fileSize': row['filesize'] if row['status'] == 'completed' else None,
+              'expiresAt': row['expires'] if row['status'] == 'completed' else None,
+              'kind': row['kind']}
+    if row['kind'] == 'playlist':
+        with db() as c:
+            items = c.execute('''SELECT position,title,status,stage,percent,error_code
+                                 FROM playlist_items WHERE job_id=? ORDER BY position''', (row['id'],)).fetchall()
+        result['playlist'] = {'total': len(items),
+                              'completed': sum(x['status'] == 'completed' for x in items),
+                              'failed': sum(x['status'] == 'failed' for x in items),
+                              'items': [{'position': x['position'], 'title': x['title'],
+                                         'status': x['status'], 'stage': x['stage'],
+                                         'percent': round(x['percent'], 1) if x['percent'] is not None else None,
+                                         'error': MESSAGES.get(x['error_code'], MESSAGES['PROCESSING']) if x['error_code'] else None}
+                                        for x in items]}
+    return result
 
 
 def require_job(job_id: str, token: str) -> sqlite3.Row:
@@ -342,11 +431,17 @@ def download(body: DownloadBody, request: Request):
         if body.publish and not info.get('publicEligible', True):
             raise api_error('UNAVAILABLE', 422)
         job_id, token = uuid.uuid4().hex, secrets.token_urlsafe(32)
+        kind = info.get('kind', 'single')
         c.execute('''INSERT INTO jobs
-          (id,token_hash,url,title,profile,metadata,publish,source,status,stage,percent,created)
-          VALUES(?,?,?,?,?,?,?,?,?,?,?,?)''',
+          (id,token_hash,url,title,profile,metadata,publish,source,status,stage,percent,created,kind)
+          VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)''',
           (job_id, hashlib.sha256(token.encode()).hexdigest(), inspection['url'], info['title'],
-           json.dumps(profile), int(body.metadata), int(body.publish), info['source'], 'queued', 'Na fila', None, epoch()))
+           json.dumps(profile), int(body.metadata), int(body.publish), info['source'],
+           'queued', 'Na fila', None, epoch(), kind))
+        if kind == 'playlist':
+            for position, entry in enumerate(info['entries'], 1):
+                c.execute('''INSERT INTO playlist_items(job_id,position,video_id,title,url)
+                             VALUES(?,?,?,?,?)''', (job_id, position, entry['id'], entry['title'], entry['url']))
     return {'id': job_id, 'token': token, 'status': 'queued'}
 
 
@@ -405,12 +500,13 @@ def file(job_id: str, token: str = ''):
     if row['status'] != 'completed' or not row['expires'] or epoch() > row['expires']:
         raise api_error('EXPIRED', 410)
     try:
-        paths = [p for p in (WORK / job_id).iterdir() if p.is_file() and p.name.startswith('media.') and p.suffix.lower() in ('.mp4', '.mp3', '.m4a')]
+        allowed = ('.zip',) if row['kind'] == 'playlist' else ('.mp4', '.mp3', '.m4a')
+        paths = [p for p in (WORK / job_id).iterdir() if p.is_file() and p.name.startswith('media.') and p.suffix.lower() in allowed]
     except FileNotFoundError:
         raise api_error('EXPIRED', 410)
     if not paths:
         raise api_error('EXPIRED', 410)
-    mime = {'.mp4': 'video/mp4', '.mp3': 'audio/mpeg', '.m4a': 'audio/mp4'}[paths[0].suffix.lower()]
+    mime = {'.mp4': 'video/mp4', '.mp3': 'audio/mpeg', '.m4a': 'audio/mp4', '.zip': 'application/zip'}[paths[0].suffix.lower()]
     response = FileResponse(paths[0], media_type=mime, filename=row['filename'])
     response.headers['Cache-Control'] = 'private, no-store'
     return response
@@ -433,14 +529,10 @@ def set_job(job_id: str, **fields):
         c.execute('UPDATE jobs SET '+','.join(f'{k}=?' for k in fields)+' WHERE id=?', (*fields.values(), job_id))
 
 
-def execute_job(row: sqlite3.Row) -> None:
-    job_id = row['id']
-    folder = WORK / job_id
-    folder.mkdir(mode=0o700, parents=True, exist_ok=True)
-    profile = json.loads(row['profile'])
+def media_command(url: str, profile: dict[str, Any], folder: Path, embed: bool) -> list[str]:
     kind, ext = profile['kind'], profile['ext'].lower()
     command = [sys.executable, '-m', 'yt_dlp', '--ignore-config', '--no-playlist', '--no-warnings',
-               '--newline', '--socket-timeout', '15', '--retries', '2', '--fragment-retries', '2',
+               '--newline', '--js-runtimes', 'node', '--socket-timeout', '15', '--retries', '2', '--fragment-retries', '2',
                '--max-filesize', str(MAX_BYTES), '--progress-template',
                'download:DL:%(progress._percent_str)s|%(progress.downloaded_bytes)s|%(progress.total_bytes)s|%(progress.total_bytes_estimate)s',
                '--output', str(folder / 'media.%(ext)s')]
@@ -451,9 +543,19 @@ def execute_job(row: sqlite3.Row) -> None:
         command += ['--format', 'bestaudio/best', '--extract-audio', '--audio-format', ext]
         if ext == 'mp3':
             command += ['--audio-quality', profile['label'].split()[0] + 'K']
-    if row['metadata']:
+    if embed:
         command += ['--embed-metadata', '--embed-thumbnail']
-    command += [row['url']]
+    command += [url]
+    return command
+
+
+def execute_job(row: sqlite3.Row) -> None:
+    job_id = row['id']
+    folder = WORK / job_id
+    folder.mkdir(mode=0o700, parents=True, exist_ok=True)
+    profile = json.loads(row['profile'])
+    kind, ext = profile['kind'], profile['ext'].lower()
+    command = media_command(row['url'], profile, folder, bool(row['metadata']))
     set_job(job_id, status='running', stage='Obtendo arquivo', percent=None)
     proc = None
     deadline = time.monotonic() + JOB_TIMEOUT
@@ -537,6 +639,157 @@ def folder_size(folder: Path) -> int:
         return 0
 
 
+def set_playlist_item(job_id: str, position: int, **fields):
+    if not fields:
+        return
+    with db() as c:
+        c.execute('UPDATE playlist_items SET ' + ','.join(f'{key}=?' for key in fields) +
+                  ' WHERE job_id=? AND position=?', (*fields.values(), job_id, position))
+
+
+def playlist_cancelled(job_id: str) -> bool:
+    with db() as c:
+        row = c.execute('SELECT cancel_requested FROM jobs WHERE id=?', (job_id,)).fetchone()
+    return bool(row and row['cancel_requested'])
+
+
+def execute_playlist_job(row: sqlite3.Row) -> None:
+    """Process entries in source order. One subprocess at a time, one ZIP at end."""
+    job_id = row['id']
+    folder = WORK / job_id
+    folder.mkdir(mode=0o700, parents=True, exist_ok=True)
+    profile = json.loads(row['profile'])
+    ext = profile['ext'].lower()
+    with db() as c:
+        entries = c.execute('SELECT * FROM playlist_items WHERE job_id=? ORDER BY position', (job_id,)).fetchall()
+    total = len(entries)
+    successes: list[tuple[int, Path]] = []
+    try:
+        for item in entries:
+            position = item['position']
+            if playlist_cancelled(job_id):
+                raise RuntimeError('CANCELED')
+            # Stop if aggregate storage has reached the safe limit.
+            if folder_tree_size(folder) >= MAX_PLAYLIST_TOTAL_BYTES:
+                set_playlist_item(job_id, position, status='failed', stage='Falha', error_code='TOO_LARGE')
+                for pending in entries[position:]:
+                    set_playlist_item(job_id, pending['position'], status='failed', stage='Falha', error_code='TOO_LARGE')
+                break
+            item_folder = folder / f'work-{position:03d}'
+            item_folder.mkdir(mode=0o700, exist_ok=True)
+            stage = f'Obtendo {position}/{total}'
+            set_job(job_id, status='running', stage=stage, percent=100 * (position - 1) / total)
+            set_playlist_item(job_id, position, status='running', stage='Obtendo arquivo', percent=None)
+            command = media_command(item['url'], profile, item_folder, bool(row['metadata']))
+            command[command.index('--max-filesize'):command.index('--max-filesize')+2] = ['--max-filesize', str(min(MAX_BYTES, MAX_PLAYLIST_TOTAL_BYTES))]
+            command[command.index('--output'):command.index('--output')] = [
+                '--match-filter', f'duration <= {MAX_DURATION} & !is_live']
+            deadline = time.monotonic() + JOB_TIMEOUT
+            code = None
+            tail = ''
+            proc = None
+            try:
+                proc = subprocess.Popen(command, cwd=str(item_folder), stdout=subprocess.PIPE,
+                                        stderr=subprocess.STDOUT, text=True, errors='replace',
+                                        bufsize=1, start_new_session=True)
+                with lock:
+                    processes[job_id] = proc
+                def watchdog():
+                    while proc.poll() is None:
+                        if (playlist_cancelled(job_id) or time.monotonic() >= deadline or
+                                folder_tree_size(folder) >= MAX_PLAYLIST_TOTAL_BYTES or
+                                folder_tree_size(item_folder) >= MAX_BYTES):
+                            try:
+                                os.killpg(proc.pid, signal.SIGTERM)
+                            except ProcessLookupError:
+                                pass
+                            return
+                        time.sleep(1)
+                threading.Thread(target=watchdog, daemon=True).start()
+                assert proc.stdout is not None
+                for line in proc.stdout:
+                    line = line.strip()
+                    tail = (tail + '\n' + line)[-7000:]
+                    if 'DL:' in line:
+                        found = re.search(r'DL:\s*([\d.,]+)%', line)
+                        pct = float(found.group(1).replace(',', '.')) if found else None
+                        if pct is not None:
+                            pct = min(99, max(0, pct))
+                            set_playlist_item(job_id, position, stage='Obtendo arquivo', percent=pct)
+                            set_job(job_id, percent=round(((position - 1) + pct / 100) / total * 100, 2))
+                    elif any(x in line for x in ('[Merger]', '[VideoConvertor]', '[ExtractAudio]', '[Fixup')):
+                        set_playlist_item(job_id, position, stage='Convertendo arquivo', percent=None)
+                        set_job(job_id, stage=f'Convertendo {position}/{total}', percent=None)
+                    elif any(x in line for x in ('[Metadata]', '[EmbedThumbnail]')):
+                        set_playlist_item(job_id, position, stage='Adicionando metadados', percent=None)
+                        set_job(job_id, stage=f'Metadados {position}/{total}', percent=None)
+                rc = proc.wait()
+                if playlist_cancelled(job_id):
+                    raise RuntimeError('CANCELED')
+                if time.monotonic() >= deadline:
+                    raise RuntimeError('TIMED_OUT')
+                if folder_tree_size(folder) >= MAX_PLAYLIST_TOTAL_BYTES or folder_tree_size(item_folder) >= MAX_BYTES:
+                    raise RuntimeError('TOO_LARGE')
+                if rc != 0:
+                    raise RuntimeError(failure_code(tail))
+                output = [f for f in item_folder.iterdir() if f.is_file() and f.suffix.lower() == '.' + ext]
+                if not output:
+                    raise RuntimeError('PROCESSING')
+                selected = max(output, key=lambda f: f.stat().st_size)
+                name = f'{position:02d} - {safe_filename(item["title"], ext)}'
+                target = folder / name
+                selected.replace(target)
+                successes.append((position, target))
+                set_playlist_item(job_id, position, status='completed', stage='Concluído',
+                                  percent=100, filename=name, filesize=target.stat().st_size)
+            except Exception as exc:
+                code = str(exc) if str(exc) in MESSAGES else 'PROCESSING'
+                if code == 'CANCELED':
+                    set_playlist_item(job_id, position, status='canceled', stage='Cancelado', error_code=code)
+                    raise
+                set_playlist_item(job_id, position, status='failed', stage='Falha', percent=None, error_code=code)
+            finally:
+                with lock:
+                    processes.pop(job_id, None)
+                shutil.rmtree(item_folder, ignore_errors=True)
+            set_job(job_id, percent=round(position / total * 100, 2))
+        if playlist_cancelled(job_id):
+            raise RuntimeError('CANCELED')
+        if not successes:
+            raise RuntimeError('PLAYLIST_FAILED')
+        set_job(job_id, stage='Criando ZIP', percent=None)
+        archive = folder / 'media.zip'
+        with zipfile.ZipFile(archive, 'w', compression=zipfile.ZIP_STORED, allowZip64=True) as out:
+            for _, path in successes:
+                out.write(path, arcname=path.name)
+        if archive.stat().st_size > MAX_PLAYLIST_TOTAL_BYTES:
+            raise RuntimeError('TOO_LARGE')
+        for _, path in successes:
+            path.unlink(missing_ok=True)
+        finished = epoch()
+        with db() as c:
+            c.execute("""UPDATE jobs SET status='completed',stage=?,percent=100,
+                         filename=?,filesize=?,completed=?,expires=? WHERE id=?""",
+                      (f'Concluído · {len(successes)}/{total}', safe_filename(row['title'], 'zip'),
+                       archive.stat().st_size, finished, finished + EXPIRES_SECONDS, job_id))
+    except Exception as exc:
+        code = str(exc) if str(exc) in MESSAGES else 'PROCESSING'
+        set_job(job_id, status='canceled' if code == 'CANCELED' else 'failed',
+                stage='Cancelado' if code == 'CANCELED' else 'Falha', percent=None, error_code=code)
+        if code == 'CANCELED':
+            with db() as c:
+                c.execute("""UPDATE playlist_items SET status='canceled',stage='Cancelado',error_code='CANCELED'
+                             WHERE job_id=? AND status IN ('queued','running')""", (job_id,))
+        shutil.rmtree(folder, ignore_errors=True)
+
+
+def folder_tree_size(folder: Path) -> int:
+    try:
+        return sum(p.stat().st_size for p in folder.rglob('*') if p.is_file())
+    except (FileNotFoundError, OSError):
+        return 0
+
+
 def worker():
     while True:
         with db() as c:
@@ -546,7 +799,7 @@ def worker():
                 if not claimed:
                     job = None
         if job:
-            execute_job(job)
+            (execute_playlist_job if job['kind'] == 'playlist' else execute_job)(job)
         else:
             time.sleep(1)
 
@@ -559,6 +812,7 @@ def cleanup():
             for row in rows:
                 c.execute("UPDATE jobs SET status='expired',stage='Expirado',error_code='EXPIRED' WHERE id=?", (row['id'],))
             c.execute('DELETE FROM inspections WHERE created < ?', (now - INSPECT_TTL,))
+            c.execute('DELETE FROM playlist_items WHERE job_id IN (SELECT id FROM jobs WHERE created < ? AND status IN (\'expired\',\'failed\',\'canceled\'))', (now - 86400 * 3,))
             c.execute('DELETE FROM jobs WHERE created < ? AND status IN (\'expired\',\'failed\',\'canceled\')', (now - 86400 * 3,))
         for row in rows:
             shutil.rmtree(WORK / row['id'], ignore_errors=True)

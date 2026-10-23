@@ -78,7 +78,21 @@
     $('results').classList.remove('hide');
     $('media-platform').textContent = info.source;
     $('media-title').textContent = info.title;
-    $('media-duration').textContent = [info.author, formatDuration(info.duration)].filter(Boolean).join(' · ');
+    $('media-duration').textContent = info.kind === 'playlist'
+      ? [info.author, `${info.count} vídeos`].filter(Boolean).join(' · ')
+      : [info.author, formatDuration(info.duration)].filter(Boolean).join(' · ');
+    $('playlist-preview').classList.toggle('hide', info.kind !== 'playlist');
+    if (info.kind === 'playlist') {
+      $('playlist-count').textContent = `${info.count} vídeos · Em sequência`;
+      const host = $('playlist-entries'); host.replaceChildren();
+      for (const [i, entry] of info.entries.entries()) {
+        const line = document.createElement('div'); line.className = 'playlist-entry';
+        const index = document.createElement('span'); index.className = 'playlist-index'; index.textContent = String(i + 1).padStart(2, '0');
+        const title = document.createElement('span'); title.className = 'playlist-entry-title'; title.textContent = entry.title;
+        line.append(index, title); host.append(line);
+      }
+    }
+    try { sessionStorage.setItem('lastInspection', JSON.stringify(info)); } catch { /* storage disabled */ }
     $('public-history').disabled = info.publicEligible === false;
     if (info.publicEligible === false) $('public-history').checked = false;
     const thumb = safeThumb(info.thumbnail);
@@ -89,6 +103,7 @@
   async function inspect() {
     if (state.job && !state.job.terminal) { toast('Aguarde ou cancele o processamento atual.'); return; }
     const url = $('url-input').value.trim(); const seq = ++state.seq;
+    try { sessionStorage.removeItem('lastInspection'); } catch { /* disabled */ }
     clearError(); resetProgress(); state.info = null; $('results').classList.add('hide');
     if (!url) { msg('Cole um link de vídeo para continuar.'); $('url-input').focus(); return; }
     try {
@@ -115,12 +130,30 @@
     const actions = $('result-actions'); if (actions) actions.replaceChildren();
     $('prep-percent').textContent = ''; $('prep-fill').style.width = '0%';
     $('prep-fill').classList.remove('indeterminate'); $('prep-progress').removeAttribute('aria-valuenow');
+    $('playlist-progress').classList.add('hide'); $('playlist-progress-items').replaceChildren();
     state.job = null; try { sessionStorage.removeItem('activeJob'); } catch { /* storage disabled */ }
   }
   function ensureActions() {
     let el = $('result-actions');
     if (!el) { el = document.createElement('div'); el.id = 'result-actions'; el.className = 'bottom-actions'; $('prep-panel').after(el); }
     return el;
+  }
+  function renderPlaylistStatus(playlist) {
+    $('playlist-progress').classList.toggle('hide', !playlist);
+    if (!playlist) return;
+    const host = $('playlist-progress-items'); host.replaceChildren();
+    for (const entry of playlist.items) {
+      const line = document.createElement('div'); line.className = 'playlist-entry';
+      const index = document.createElement('span'); index.className = 'playlist-index';
+      index.textContent = String(entry.position).padStart(2, '0');
+      const title = document.createElement('span'); title.className = 'playlist-entry-title'; title.textContent = entry.title;
+      const status = document.createElement('span'); status.className = 'playlist-entry-state';
+      status.textContent = entry.status === 'completed' ? 'Concluído' : entry.status === 'failed'
+        ? 'Falhou' : entry.status === 'running'
+          ? (entry.percent == null ? entry.stage : `${entry.percent}%`) : entry.status === 'canceled' ? 'Cancelado' : 'Na fila';
+      if (entry.error) status.title = entry.error;
+      line.append(index, title, status); host.append(line);
+    }
   }
   function renderJob(data) {
     const active = !['completed','failed','canceled','expired'].includes(data.status);
@@ -129,6 +162,7 @@
     $('example-btn').disabled = active;
     $('prep-panel').classList.remove('hide');
     $('prep-title').textContent = data.error?.message || data.stage || 'Preparando';
+    renderPlaylistStatus(data.playlist || null);
     const percent = typeof data.percent === 'number' ? Math.max(0, Math.min(100, data.percent)) : null;
     $('prep-percent').textContent = percent !== null ? `${Number(percent.toFixed(1))}%` : '';
     $('prep-fill').classList.toggle('indeterminate', percent === null && !['completed','failed','canceled','expired'].includes(data.status));
@@ -142,6 +176,10 @@
       $('prepare-btn').disabled = false; $('prepare-btn').innerHTML = iconDownload + 'Preparar outro arquivo';
       const a = document.createElement('a'); a.className = 'primary'; a.textContent = 'Baixar arquivo';
       a.href = `/api/downloads/${encodeURIComponent(state.job.id)}/file${params(state.job)}`;
+      if (data.kind === 'playlist') {
+        a.textContent = 'Baixar playlist (.zip)';
+        if (data.playlist?.failed) toast(`${data.playlist.failed} vídeo(s) não puderam ser preparados. Os demais estão no ZIP.`);
+      }
       actions.append(a);
     } else if (['failed', 'canceled', 'expired'].includes(data.status)) {
       state.job.terminal = true; stopListening(); $('prepare-btn').disabled = false;
@@ -222,5 +260,10 @@
     const dark = document.documentElement.dataset.theme !== 'dark'; document.documentElement.dataset.theme = dark ? 'dark' : 'light';
     $('theme-moon').classList.toggle('hide', dark); $('theme-sun').classList.toggle('hide', !dark);
   });
-  try { const saved = JSON.parse(sessionStorage.getItem('activeJob') || 'null'); if (saved?.id && saved?.token) watch(saved); } catch { /* no resumable session */ }
+  try {
+    const saved = JSON.parse(sessionStorage.getItem('activeJob') || 'null');
+    const inspection = JSON.parse(sessionStorage.getItem('lastInspection') || 'null');
+    if (inspection?.inspectionId && inspection?.profiles) showResult(inspection);
+    if (saved?.id && saved?.token) watch(saved);
+  } catch { /* no resumable session */ }
 })();

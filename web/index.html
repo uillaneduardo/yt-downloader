@@ -60,6 +60,16 @@
 
     .poster.has-thumb{background-size:cover;background-position:center}.poster.has-thumb::before,.poster.has-thumb::after,.poster.has-thumb .poster-lines{display:none}.poster.has-thumb .poster-inner{background:linear-gradient(0deg,rgba(0,0,0,.42),transparent 45%)}.prep-error{margin-top:12px}.history-item a:hover{text-decoration:underline}
     .prep-fill.indeterminate{animation:process-wave 1.5s ease-in-out infinite alternate}@keyframes process-wave{from{transform:translateX(0)}to{transform:translateX(185%)}}
+  
+    .playlist-preview{border-top:1px solid var(--line);padding-top:14px;display:grid;gap:8px}
+    .playlist-preview strong{font-size:12px;font-weight:750}
+    .playlist-rows{display:grid;gap:1px;max-height:160px;overflow:auto}
+    .playlist-entry{display:flex;align-items:center;gap:9px;padding:6px 0;font-size:12px;color:var(--ink2);min-width:0}
+    .playlist-index{font-variant-numeric:tabular-nums;color:var(--muted);flex:0 0 22px}
+    .playlist-entry-title{flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;min-width:0}
+    .playlist-entry-state{font-size:11px;color:var(--muted);flex-shrink:0}
+    .playlist-progress{border-top:1px solid var(--line);padding-top:12px;margin-top:10px}
+    .playlist-progress .playlist-rows{max-height:210px}
   </style>
 </head>
 <body>
@@ -98,6 +108,7 @@
               <div class="poster-inner"><div class="play-button"><svg class="icon" viewBox="0 0 24 24"><path d="m7 3 15 9-15 9z"/></svg></div></div>
             </div>
             <div class="media-details"><div class="media-platform" id="media-platform">YouTube</div><div class="media-title" id="media-title">Vídeo de exemplo</div><div class="media-meta"><span id="media-duration"></span></div></div>
+            <div id="playlist-preview" class="playlist-preview hide"><strong id="playlist-count"></strong><div id="playlist-entries" class="playlist-rows"></div></div>
           </div>
           <div class="right-pane">
             
@@ -105,7 +116,7 @@
             <div class="control-label">Qualidade</div><div id="format-list" class="option-list" role="group" aria-label="Qualidade e formato do arquivo"></div>
             <div class="file-options"><label class="toggle-row"><input type="checkbox" id="metadata" checked>Capa e metadados</label><label class="toggle-row"><input type="checkbox" id="public-history">Publicar no histórico</label></div>
             <div class="bottom-actions"><button class="primary" id="prepare-btn" type="button"><svg class="icon icon-sm" viewBox="0 0 24 24"><path d="M12 3v12m-4-4 4 4 4-4M4 17v3h16v-3"/></svg>Preparar arquivo</button></div>
-            <div id="prep-panel" class="prep-panel hide" aria-live="polite"><div class="prep-head"><strong id="prep-title">Obtendo arquivo</strong><span id="prep-percent">0%</span></div><div class="prep-track" role="progressbar" id="prep-progress" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" aria-label="Progresso do processamento"><div class="prep-fill" id="prep-fill"></div></div></div>
+            <div id="prep-panel" class="prep-panel hide" aria-live="polite"><div class="prep-head"><strong id="prep-title">Obtendo arquivo</strong><span id="prep-percent">0%</span></div><div class="prep-track" role="progressbar" id="prep-progress" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" aria-label="Progresso do processamento"><div class="prep-fill" id="prep-fill"></div></div><div id="playlist-progress" class="playlist-progress hide"><div id="playlist-progress-items" class="playlist-rows"></div></div></div>
           </div>
         </div>
       </section>

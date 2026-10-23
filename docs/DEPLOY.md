@@ -7,7 +7,7 @@ cd ~/homelab/apps
 git clone https://github.com/uillaneduardo/yt-downloader.git
 cd yt-downloader
 cp .env.example .env
-# Ajuste TRUST_CF_IP=1 no .env somente se o Cloudflare Tunnel for a única entrada HTTP
+# Ajuste TRUST_CF_IP=1 no .env se cloudflared for o único proxy e a conexão chegar por localhost
 mkdir -p data
 sudo chown -R 10001:10001 data
 sudo docker compose config --quiet
@@ -62,7 +62,7 @@ Antes de exposição pública, configurar WAF/Rate Limiting na Cloudflare, revis
 | `MAX_DURATION_SECONDS` | `5400` | Duração limite de vídeo |
 | `FILE_TTL_SECONDS` | `7200` | Retenção do arquivo pronto |
 | `JOB_TIMEOUT_SECONDS` | `2700` | Tempo limite por processamento |
-| `TRUST_CF_IP` | `0` | Use `1` apenas se o tunnel for a única entrada HTTP (porta bindada em loopback no host). O IP do cabeçalho é validado; no container, o peer pode ser o gateway Docker |
+| `TRUST_CF_IP` | `0` | Use `1` somente se o tunnel for a única entrada HTTP (porta bindada em loopback no host). O backend valida o IP recebido do cabeçalho; no container, o peer pode ser o gateway Docker |
 
 ## Homologação manual
 
@@ -75,3 +75,20 @@ Antes de exposição pública, configurar WAF/Rate Limiting na Cloudflare, revis
 7. Histórico deve ficar vazio sem opt-in e registrar metadados sem identificação do usuário quando habilitado.
 8. Aguardar TTL e verificar expiração/remoção do arquivo.
 9. Reiniciar container e confirmar restauração de fila e tratamento de jobs interrompidos.
+
+## Habilitar playlists YouTube (v0.2)
+
+Na pasta da aplicação, atualize a branch e faça o rebuild. O banco SQLite existente é migrado automaticamente, sem apagar o histórico.
+
+```bash
+cd ~/homelab/apps/yt-downloader
+git fetch origin feat/mvp-downloads-homelab
+git switch homologacao  # se esta branch já existe na VM
+git pull --ff-only origin feat/mvp-downloads-homelab
+# Opcional: configure MAX_PLAYLIST_ITEMS=20 e MAX_PLAYLIST_TOTAL_MB=2048 no .env
+sudo docker compose config --quiet
+sudo docker compose up -d --build
+curl -fsS http://127.0.0.1:8098/api/health
+```
+
+A aplicação aceita URLs `https://www.youtube.com/playlist?list=...`, limita a 20 itens inicialmente, baixa sequencialmente e entrega um arquivo ZIP. Não publica playlists no histórico. Garanta espaço em disco adicional durante a montagem do ZIP. Se um vídeo individual falhar, os demais continuam. Para homologar, teste uma playlist pública de 2 a 3 vídeos curtos, selecione MP4/MP3, confira a ordem no ZIP e teste cancelamento.
