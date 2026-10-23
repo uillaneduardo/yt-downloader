@@ -58,7 +58,7 @@ HOST = os.getenv('PUBLIC_HOST', 'yt.ulln.com.br')
 IP_RETENTION_DAYS = max(1,min(30,int(os.getenv('IP_RETENTION_DAYS','7'))))
 JOB_RETENTION_DAYS = max(7,min(365,int(os.getenv('JOB_RETENTION_DAYS','30'))))
 MAX_PARALLEL_DOWNLOADS = max(1,min(8,int(os.getenv('MAX_PARALLEL_DOWNLOADS','2'))))
-APP_VERSION = '0.4.0'
+APP_VERSION = '0.5.0'
 
 DATA.mkdir(parents=True, exist_ok=True)
 WORK.mkdir(parents=True, exist_ok=True)
@@ -155,6 +155,7 @@ class DownloadBody(BaseModel):
     publish: bool = False
     selectedPositions: list[int] | None = None
     concurrency: int = Field(default=1, ge=1, le=8)
+    itemProfiles: dict[int, str] | None = None
 
 
 MESSAGES = {
@@ -463,7 +464,7 @@ def require_job(job_id: str, token: str) -> sqlite3.Row:
 
 @app.post('/api/downloads', status_code=202)
 def download(body: DownloadBody, request: Request):
-    allow_rate(request, 6, 600)
+    allow_rate(request, 20, 600)
     with db() as c:
         inspection = c.execute('SELECT * FROM inspections WHERE id=?', (body.inspectionId,)).fetchone()
         if not inspection or epoch() - inspection['created'] > INSPECT_TTL:

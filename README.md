@@ -2,11 +2,12 @@
 
 Downloader web auto-hospedado de vídeo e áudio (YouTube / Vimeo), com interface monocromática, fila persistente, administração, metadados, histórico público opcional e arquivos individuais.
 
-## Recursos v0.4.0
+## Recursos v0.5.0
 
 - Cole **um ou vários links**, separados por vírgula, ponto e vírgula, espaços, tabulações ou linhas (Enter).
 - Aceita URLs de vídeo YouTube/Vimeo e playlists do YouTube. Playlists são expandidas para uma lista de vídeos individuais.
-- Antes de baixar, **marque quais vídeos** deseja processar e selecione o formato/qualidade.
+- Cada vídeo aparece em um card próprio, com seleção de vídeo/áudio, formato e qualidade, botão Preparar arquivo, progresso e Baixar arquivo.
+- Preparar selecionados mantém o processamento coletivo e a concorrência definida pelo visitante.
 - **Nenhum ZIP é criado para novos lotes**: cada item concluído apresenta seu botão **Baixar** próprio na lista.
 - Escolha **X downloads simultâneos** (de 1 até o teto global do administrador, 2 por padrão, máximo configurável de 8).
 - A fila respeita o máximo global mesmo com vários visitantes. Um erro individual não cancela os demais.
@@ -76,3 +77,9 @@ Veja [docs/DEPLOY.md](docs/DEPLOY.md), [docs/ARCHITECTURE.md](docs/ARCHITECTURE.
 ## Arquivos no painel de administração
 
 Em **/admin > Arquivos armazenados**, cada trabalho concluído oferece **Baixar** (arquivo original preparado) e **Excluir**. A rota `GET /api/admin/jobs/{id}/file` exige sessão administrativa. Ela nunca aceita caminho fornecido pelo usuário e só serve arquivos já concluídos, disponíveis no armazenamento.
+
+## v0.5.0 — cards individuais para listas e playlists
+
+Após analisar vários links, o frontend mostra todos os vídeos em cards com controles independentes de formato, qualidade e Preparar arquivo. Cada arquivo possui status e botão Baixar próprio; não gera ZIP. O visitante ainda pode marcar vários itens e usar Preparar selecionados, com concorrência limitada pelo servidor.
+
+Para links avulsos, o yt-dlp fornece perfis de cada vídeo, exibidos individualmente. A inspeção plana de playlists oferece qualidades máximas (Até Xp), sem garantir que cada vídeo possua a resolução. O endpoint POST /api/downloads aceita `itemProfiles` opcional, mapeando posições (1-based) para IDs dos perfis, por exemplo `{"1":"video-mp4-720","2":"audio-mp3-192"}`. Os perfis são verificados por vídeo; o campo legado `profileId` permanece suportado. O token temporário continua necessário para cada arquivo baixado.
