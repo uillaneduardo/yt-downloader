@@ -230,21 +230,23 @@ def test_playlist_create_status_and_publish_rejection(monkeypatch):
                             'title':f'Item {i}'} for i in range(3)], 'count':3,
                 'profiles':[{'id':'video-mp4-720','kind':'video','ext':'MP4','height':720,'label':'Até 720p'}]}
     monkeypatch.setattr(main, 'inspect_playlist', fake_playlist)
-    monkeypatch.setattr(main, 'execute_playlist_job', lambda _row: None)
+    monkeypatch.setattr(main, 'execute_job', lambda _row: None)
     with TestClient(main.app) as c:
         i = c.post('/api/inspect', json={'url':'https://www.youtube.com/playlist?list=PLabcdefgh123456'})
         assert i.status_code == 200, i.text
+        assert i.json()['kind'] == 'batch'
         iid = i.json()['inspectionId']
-        denied = c.post('/api/downloads',json={'inspectionId':iid,'profileId':'video-mp4-720','publish':True})
+        denied = c.post('/api/downloads',json={'inspectionId':iid,'profileId':'video-mp4-720','publish':True,'selectedPositions':[1]})
         assert denied.status_code == 422
-        r = c.post('/api/downloads',json={'inspectionId':iid,'profileId':'video-mp4-720'})
+        r = c.post('/api/downloads',json={'inspectionId':iid,'profileId':'video-mp4-720','selectedPositions':[1,3],'concurrency':1})
         assert r.status_code == 202, r.text
         job = r.json()
         assert c.get(f'/api/downloads/{job["id"]}',params={'token':'wrong'}).status_code == 404
         status = c.get(f'/api/downloads/{job["id"]}',params={'token':job['token']}).json()
-        assert status['kind'] == 'playlist'
-        assert status['playlist']['total'] == 3
-        assert len(status['playlist']['items']) == 3
+        assert status['kind'] == 'batch'
+        assert status['batch']['total'] == 2
+        assert [entry['position'] for entry in status['batch']['items']] == [1,3]
+        assert c.get(f'/api/downloads/{job["id"]}/file',params={'token':job['token']}).status_code == 410
         assert c.post(f'/api/downloads/{job["id"]}/cancel',params={'token':job['token']}).status_code == 200
 
 
@@ -481,6 +483,8 @@ def test_admin_ip_file_management_and_privacy(monkeypatch):
         folder.mkdir(exist_ok=True)
         (folder/'media.mp4').write_bytes(b'fake mp4')
         main.set_job(job_id,status='completed',expires=main.epoch()+1000)
+        assert c.get(f'/api/admin/jobs/{job_id}/file').content == b'fake mp4'
+        assert c.get('/api/admin/jobs/invalid/file').status_code == 404
         removed = c.delete(f'/api/admin/jobs/{job_id}/files',headers={'X-Admin-CSRF':csrf})
         assert removed.status_code == 200,removed.text
         assert not folder.exists()
@@ -490,3 +494,131 @@ def test_admin_ip_file_management_and_privacy(monkeypatch):
         main.admin_privacy_cleanup()
         assert next(r for r in c.get('/api/admin/jobs').json()['items'] if r['id']==job_id)['client_ip'] is None
         assert c.get('/api/history').json().get('items') is not None
+
+
+def test_split_links_and_multiurl_batch(monkeypatch):
+    from app.batch import split_links
+    one='https://www.youtube.com/watch?v=aqz-KE-bpKQ'
+    two='https://vimeo.com/12345'
+    assert split_links(f'{one}, {two};\n {one}\t{two}') == [one,two]
+    monkeypatch.setattr(main,'inspect_media',fake_info)
+    main.init_db()
+    main.rate.clear()
+    with main.db() as c:
+        c.execute("UPDATE jobs SET status='failed' WHERE status IN ('queued','running')")
+    monkeypatch.setattr(main,'runner_started',True)
+    with TestClient(main.app) as client:
+        inspected=client.post('/api/inspect',json={'url':f'{one};\n{two}'}).json()
+        assert inspected['kind']=='batch' and inspected['count']==2
+        assert client.post('/api/downloads',json={
+            'inspectionId':inspected['inspectionId'],'profileId':'video-mp4-720',
+            'selectedPositions':[1,1],'concurrency':1}).status_code==422
+        assert client.post('/api/downloads',json={
+            'inspectionId':inspected['inspectionId'],'profileId':'video-mp4-720',
+            'selectedPositions':[3],'concurrency':1}).status_code==422
+        bad=client.post('/api/downloads',json={
+            'inspectionId':inspected['inspectionId'],'profileId':'video-mp4-720',
+            'selectedPositions':[1],'concurrency':main.MAX_PARALLEL_DOWNLOADS+1})
+        assert bad.status_code in (422,)
+
+
+def test_batch_individual_files_and_concurrency(monkeypatch):
+    one='https://www.youtube.com/watch?v=aqz-KE-bpKQ'
+    two='https://vimeo.com/12345'
+    monkeypatch.setattr(main,'inspect_media',fake_info)
+    monkeypatch.setattr(main,'runner_started',True)
+    monkeypatch.setattr(main,'MAX_PARALLEL_DOWNLOADS',2)
+    main.init_db()
+    main.rate.clear()
+    with main.db() as c:
+        c.execute("UPDATE jobs SET status='failed' WHERE status IN ('queued','running')")
+    with TestClient(main.app) as client:
+        inspection=client.post('/api/inspect',json={'url':f'{one} {two}'}).json()
+        result=client.post('/api/downloads',json={'inspectionId':inspection['inspectionId'],
+            'profileId':'video-mp4-720','selectedPositions':[1,2], 'concurrency':1})
+        assert result.status_code==202,result.text
+        group=result.json()
+        with main.db() as c:
+            a=main.claim_next(main,c)
+        assert a and a['parent_id']==group['id']
+        with main.db() as c:
+            assert main.claim_next(main,c) is None  # group permits 1 simultaneous
+        # Fake yt-dlp emits final file. No network or real third-party media needed.
+        class Proc:
+            pid=999999
+            def __init__(self,command,**kwargs):
+                Path(kwargs['cwd'],'media.mp4').write_bytes(b'fake video 123')
+                self.stdout=iter(['[download] DL:100.0%|12|12|NA'])
+            def poll(self): return 0
+            def wait(self): return 0
+        monkeypatch.setattr(main.subprocess,'Popen',Proc)
+        main.execute_job(a)
+        with main.db() as c:
+            b=main.claim_next(main,c)
+        assert b and b['id']!=a['id']
+        main.execute_job(b)
+        status=client.get(f'/api/downloads/{group["id"]}',params={'token':group['token']}).json()
+        assert status['status']=='completed',status
+        assert status['batch']['completed']==2
+        assert 'fileName' in status['batch']['items'][0]
+        for x in status['batch']['items']:
+            assert client.get(f'/api/downloads/{x["id"]}/file',params={'token':'wrong'}).status_code==404
+            r=client.get(f'/api/downloads/{x["id"]}/file',params={'token':group['token']})
+            assert r.status_code==200,r.text
+            assert r.content==b'fake video 123'
+            assert r.headers['content-type'].startswith('video/mp4')
+        assert not (main.WORK/group['id']/'media.zip').exists()
+
+
+def test_batch_global_limit_and_cancel(monkeypatch):
+    monkeypatch.setattr(main,'MAX_PARALLEL_DOWNLOADS',1)
+    monkeypatch.setattr(main,'runner_started',True)
+    monkeypatch.setattr(main,'inspect_media',fake_info)
+    main.init_db()
+    main.rate.clear()
+    with main.db() as c:
+        c.execute("UPDATE jobs SET status='failed' WHERE status IN ('queued','running')")
+    with TestClient(main.app) as client:
+        inspection=client.post('/api/inspect',json={'url':'https://vimeo.com/12345,https://vimeo.com/45678'}).json()
+        rejected=client.post('/api/downloads',json={'inspectionId':inspection['inspectionId'],
+            'profileId':'video-mp4-720','selectedPositions':[1,2],'concurrency':2})
+        assert rejected.status_code==422
+        created=client.post('/api/downloads',json={'inspectionId':inspection['inspectionId'],
+            'profileId':'video-mp4-720','selectedPositions':[1,2],'concurrency':1}).json()
+        with main.db() as conn:
+            claimed=main.claim_next(main,conn)
+        assert claimed is not None
+        with main.db() as conn:
+            assert main.claim_next(main,conn) is None
+        response=client.post(f'/api/downloads/{created["id"]}/cancel',params={'token':created['token']})
+        assert response.status_code==200
+        with main.db() as conn:
+            canceled=conn.execute("SELECT count(*) n FROM jobs WHERE parent_id=? AND status='canceled'", (created['id'],)).fetchone()['n']
+        assert canceled==1
+def test_admin_download_file_requires_authentication(monkeypatch):
+    import uuid, hashlib, json
+    from fastapi.testclient import TestClient
+    monkeypatch.setenv('ADMIN_PASSWORD', 'admin-test-password-123456789')
+    main.init_db()
+    job_id = uuid.uuid4().hex
+    folder = main.WORK / job_id
+    folder.mkdir(parents=True, exist_ok=True)
+    (folder / 'media.mp3').write_bytes(b'audio bytes')
+    profile = {'id':'audio-mp3-192', 'kind':'audio', 'ext':'MP3', 'label':'192 kbps'}
+    with main.db() as c:
+        c.execute("""INSERT INTO jobs (id,token_hash,url,title,profile,metadata,publish,source,status,stage,
+        percent,filename,created,kind) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+        (job_id,hashlib.sha256(b'secret').hexdigest(),'https://vimeo.com/12345',
+         'Audio',json.dumps(profile),0,0,'Vimeo','completed','Concluído',100,'Audio.mp3',main.epoch(),'single'))
+    with TestClient(main.app) as c:
+        path=f'/api/admin/jobs/{job_id}/file'
+        assert c.get(path).status_code == 401
+        assert c.post('/api/admin/login',json={'password':'admin-test-password-123456789'}).status_code == 200
+        response=c.get(path)
+        assert response.status_code == 200
+        assert response.content == b'audio bytes'
+        assert 'Audio.mp3' in response.headers['content-disposition']
+        assert 'no-store' in response.headers['cache-control']
+        assert c.get('/api/admin/jobs/abcdef/file').status_code == 404
+        (folder / 'media.mp3').unlink()
+        assert c.get(path).status_code == 404
