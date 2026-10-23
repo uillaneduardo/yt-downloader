@@ -66,3 +66,15 @@ Cole uma URL como `https://www.youtube.com/playlist?list=PL...`. O sistema lista
 O histórico público é **desativado para playlists**: a inspeção em modo plano não comprova se todos os vídeos são públicos, e não publicamos links potencialmente privados ou não listados. O arquivo ZIP também expira após o prazo configurado.
 
 Limites: `MAX_PLAYLIST_ITEMS=20`, `MAX_PLAYLIST_TOTAL_MB=2048` (espaço máximo para conteúdo/ZIP) e `JOB_TIMEOUT_SECONDS=2700` por vídeo. Para evitar sobrecarga em disco, configure o volume de dados com espaço suficiente para os vídeos **e o ZIP temporário**. Playlists enormes são recusadas na inspeção. Um download de ZIP grande pelo Cloudflare Tunnel pode depender dos limites do seu plano/infraestrutura; homologue com dois vídeos pequenos primeiro.
+
+## Limites de armazenamento (v0.2.1)
+
+O arquivo final usa `MAX_FILE_MB` (1024 MB por padrão) e os arquivos intermediários
+usam `MAX_TEMP_MB` (4096 MB). São limites distintos: vídeo, áudio e saída de
+conversão podem coexistir enquanto o trabalho está em andamento, sem provocar um
+falso erro de tamanho. Intermediários são removidos ao concluir.
+
+Para playlists, `MAX_PLAYLIST_TOTAL_MB` (2048 MB) limita o ZIP final e
+`MAX_PLAYLIST_TEMP_MB` (6144 MB) reserva o espaço de trabalho para processar
+a playlist e montar o ZIP. Verifique o espaço livre do volume `./data` antes
+de aumentar os limites. Mais detalhes em [docs/DEPLOY.md](docs/DEPLOY.md).
