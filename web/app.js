@@ -72,26 +72,48 @@
       container.append(button);
     }
   }
+  function renderBatchSelection(info) {
+    const collection = info.kind === 'batch';
+    $('playlist-preview').classList.toggle('hide', !collection);
+    $('batch-options').classList.toggle('hide', !collection);
+    if (!collection) return;
+    const host = $('playlist-entries'); host.replaceChildren();
+    const heading = $('playlist-count');
+    heading.textContent = `${info.count} vídeo(s)`;
+    const toggle = document.createElement('button'); toggle.type='button'; toggle.textContent='Desmarcar todos';
+    toggle.addEventListener('click', () => {
+      const boxes=[...host.querySelectorAll('input[type=checkbox]')];
+      const all = boxes.every(x=>x.checked); boxes.forEach(x=>x.checked=!all);
+      toggle.textContent=all?'Selecionar todos':'Desmarcar todos';
+    });
+    const wrap=document.createElement('div'); wrap.className='batch-heading';
+    heading.parentNode.insertBefore(wrap, heading); wrap.append(heading,toggle);
+    for (const [i, item] of info.entries.entries()) {
+      const row=document.createElement('label'); row.className='batch-entry';
+      const box=document.createElement('input'); box.type='checkbox';box.value=String(i+1);box.checked=true;
+      const title=document.createElement('span');title.className='batch-entry-title';title.textContent=`${String(i+1).padStart(2,'0')} · ${item.title}`;
+      row.append(box,title);host.append(row);
+    }
+    if (info.warnings?.length) toast(`${info.warnings.length} link(s) indisponível(is) foram ignorados.`);
+    const select=$('concurrency'); select.replaceChildren();
+    const max=Math.max(1,Math.min(8, Number(info.maxConcurrency)||2));
+    for(let i=1;i<=max;i++) {const opt=document.createElement('option');opt.value=String(i);opt.textContent=String(i);select.append(opt);}
+    select.value=String(Math.min(max,2));
+  }
   function showResult(info) {
     state.info = info;
     state.selected = null;
     $('results').classList.remove('hide');
     $('media-platform').textContent = info.source;
     $('media-title').textContent = info.title;
-    $('media-duration').textContent = info.kind === 'playlist'
-      ? [info.author, `${info.count} vídeos`].filter(Boolean).join(' · ')
+    $('media-duration').textContent = info.kind === 'batch'
+      ? `${info.count} vídeo(s)`
       : [info.author, formatDuration(info.duration)].filter(Boolean).join(' · ');
-    $('playlist-preview').classList.toggle('hide', info.kind !== 'playlist');
-    if (info.kind === 'playlist') {
-      $('playlist-count').textContent = `${info.count} vídeos · Em sequência`;
-      const host = $('playlist-entries'); host.replaceChildren();
-      for (const [i, entry] of info.entries.entries()) {
-        const line = document.createElement('div'); line.className = 'playlist-entry';
-        const index = document.createElement('span'); index.className = 'playlist-index'; index.textContent = String(i + 1).padStart(2, '0');
-        const title = document.createElement('span'); title.className = 'playlist-entry-title'; title.textContent = entry.title;
-        line.append(index, title); host.append(line);
-      }
-    }
+    // Restore template before re-render, avoiding accumulating wrappers across analyses.
+    const preview = $('playlist-preview');
+    const old = preview.querySelector('.batch-heading');
+    if (old) { old.replaceWith($('playlist-count')); }
+    renderBatchSelection(info);
     try { sessionStorage.setItem('lastInspection', JSON.stringify(info)); } catch { /* storage disabled */ }
     $('public-history').disabled = info.publicEligible === false;
     if (info.publicEligible === false) $('public-history').checked = false;
@@ -106,10 +128,7 @@
     try { sessionStorage.removeItem('lastInspection'); } catch { /* disabled */ }
     clearError(); resetProgress(); state.info = null; $('results').classList.add('hide');
     if (!url) { msg('Cole um link de vídeo para continuar.'); $('url-input').focus(); return; }
-    try {
-      const u = new URL(url);
-      if (u.protocol !== 'https:') throw new Error();
-    } catch { msg('Insira um link HTTPS válido do YouTube ou Vimeo.'); return; }
+    if (!url.includes('https://')) { msg('Cole links HTTPS do YouTube ou Vimeo.'); return; }
     $('loading').classList.remove('hide'); $('inspect-btn').disabled = true; $('inspect-btn').textContent = 'Analisando…';
     try {
       const result = await api('/api/inspect', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ url }) });
@@ -155,6 +174,27 @@
       line.append(index, title, status); host.append(line);
     }
   }
+  function renderBatchStatus(batch) {
+    $('playlist-progress').classList.toggle('hide', !batch);
+    if (!batch) return;
+    const host=$('playlist-progress-items');host.replaceChildren();host.classList.add('batch-progress-items');
+    for (const item of batch.items) {
+      const line=document.createElement('div');line.className='batch-entry';
+      const title=document.createElement('span');title.className='batch-entry-title';
+      title.textContent=`${String(item.position).padStart(2,'0')} · ${item.title}`;
+      const status=document.createElement('span');status.className='batch-entry-state';
+      status.textContent=item.status==='completed'?'Pronto':item.status==='failed'?'Falhou':item.status==='running'
+        ? (typeof item.percent==='number'?`${item.percent}%`:item.stage):item.status==='expired'?'Expirado':item.status==='canceled'?'Cancelado':'Na fila';
+      if(item.error)status.title=item.error.message;
+      line.append(title,status);
+      if(item.status==='completed'){
+        const a=document.createElement('a');a.className='batch-download';a.textContent='Baixar';
+        a.href=`/api/downloads/${encodeURIComponent(item.id)}/file${params(state.job)}`;
+        a.setAttribute('download',item.fileName||'');line.append(a);
+      }
+      host.append(line);
+    }
+  }
   function renderJob(data) {
     const active = !['completed','failed','canceled','expired'].includes(data.status);
     $('url-input').disabled = active;
@@ -162,7 +202,8 @@
     $('example-btn').disabled = active;
     $('prep-panel').classList.remove('hide');
     $('prep-title').textContent = data.error?.message || data.stage || 'Preparando';
-    renderPlaylistStatus(data.playlist || null);
+    if (data.kind === 'batch') renderBatchStatus(data.batch || null);
+    else renderPlaylistStatus(data.playlist || null);
     const percent = typeof data.percent === 'number' ? Math.max(0, Math.min(100, data.percent)) : null;
     $('prep-percent').textContent = percent !== null ? `${Number(percent.toFixed(1))}%` : '';
     $('prep-fill').classList.toggle('indeterminate', percent === null && !['completed','failed','canceled','expired'].includes(data.status));
@@ -176,11 +217,8 @@
       $('prepare-btn').disabled = false; $('prepare-btn').innerHTML = iconDownload + 'Preparar outro arquivo';
       const a = document.createElement('a'); a.className = 'primary'; a.textContent = 'Baixar arquivo';
       a.href = `/api/downloads/${encodeURIComponent(state.job.id)}/file${params(state.job)}`;
-      if (data.kind === 'playlist') {
-        a.textContent = 'Baixar playlist (.zip)';
-        if (data.playlist?.failed) toast(`${data.playlist.failed} vídeo(s) não puderam ser preparados. Os demais estão no ZIP.`);
-      }
-      actions.append(a);
+      if (data.kind !== 'batch') actions.append(a);
+
     } else if (['failed', 'canceled', 'expired'].includes(data.status)) {
       state.job.terminal = true; stopListening(); $('prepare-btn').disabled = false;
       $('prepare-btn').textContent = 'Tentar novamente';
@@ -214,9 +252,13 @@
     if (state.job && !state.job.terminal) return;
     resetProgress(); $('prepare-btn').disabled = true; $('prepare-btn').textContent = 'Adicionando à fila…';
     try {
+      const selectedPositions = state.info.kind === 'batch'
+        ? [...$('playlist-entries').querySelectorAll('input[type=checkbox]:checked')].map(x=>Number(x.value)) : null;
+      if (state.info.kind === 'batch' && !selectedPositions.length) throw new Error('Selecione pelo menos um vídeo.');
       const job = await api('/api/downloads', { method: 'POST', headers: {'Content-Type': 'application/json'},
         body: JSON.stringify({ inspectionId: state.info.inspectionId, profileId: state.selected,
-          metadata: $('metadata').checked, publish: $('public-history').checked }) });
+          metadata: $('metadata').checked, publish: $('public-history').checked,
+          selectedPositions, concurrency: state.info.kind==='batch'? Number($('concurrency').value):1 }) });
       watch(job);
     } catch (error) { toast(error.message); $('prepare-btn').disabled = false; $('prepare-btn').innerHTML = iconDownload + 'Preparar arquivo'; }
   }

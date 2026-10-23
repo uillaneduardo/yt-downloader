@@ -57,7 +57,8 @@ MAX_INSPECT_CONCURRENT = 2
 HOST = os.getenv('PUBLIC_HOST', 'yt.ulln.com.br')
 IP_RETENTION_DAYS = max(1,min(30,int(os.getenv('IP_RETENTION_DAYS','7'))))
 JOB_RETENTION_DAYS = max(7,min(365,int(os.getenv('JOB_RETENTION_DAYS','30'))))
-APP_VERSION = '0.3.0'
+MAX_PARALLEL_DOWNLOADS = max(1,min(8,int(os.getenv('MAX_PARALLEL_DOWNLOADS','2'))))
+APP_VERSION = '0.4.0'
 
 DATA.mkdir(parents=True, exist_ok=True)
 WORK.mkdir(parents=True, exist_ok=True)
@@ -125,13 +126,26 @@ def init_db() -> None:
         columns = {row['name'] for row in c.execute('PRAGMA table_info(jobs)')}
         if 'kind' not in columns:
             c.execute("ALTER TABLE jobs ADD COLUMN kind TEXT NOT NULL DEFAULT 'single'")
+        if 'parent_id' not in columns:
+            c.execute('ALTER TABLE jobs ADD COLUMN parent_id TEXT')
+        if 'position' not in columns:
+            c.execute('ALTER TABLE jobs ADD COLUMN position INTEGER')
+        if 'concurrency' not in columns:
+            c.execute('ALTER TABLE jobs ADD COLUMN concurrency INTEGER DEFAULT 1')
+        c.execute('CREATE INDEX IF NOT EXISTS idx_jobs_parent ON jobs(parent_id,position)')
         # A restarted download cannot be resumed mid-FFmpeg without a fresh job.
-        c.execute("UPDATE jobs SET status='failed', stage='Falha', error_code='INTERRUPTED' WHERE status='running'")
+        c.execute("UPDATE jobs SET status='failed', stage='Falha', error_code='INTERRUPTED' WHERE status='running' AND kind!='batch'")
+        # After restart, still-queued batch children continue; an in-flight child cannot resume.
+        c.execute("""UPDATE jobs SET status='queued', stage='Na fila' WHERE kind='batch'
+                     AND status='running' AND EXISTS
+                     (SELECT 1 FROM jobs child WHERE child.parent_id=jobs.id AND child.status='queued')""")
+        # No new ZIP archives are created; retire pending jobs using the old engine.
+        c.execute("UPDATE jobs SET status='failed',stage='Falha',error_code='INTERRUPTED' WHERE kind='playlist' AND status='queued'")
     admin_schema()
 
 
 class InspectBody(BaseModel):
-    url: str = Field(min_length=1, max_length=2000)
+    url: str = Field(min_length=1, max_length=12000)
 
 
 class DownloadBody(BaseModel):
@@ -139,6 +153,8 @@ class DownloadBody(BaseModel):
     profileId: str
     metadata: bool = True
     publish: bool = False
+    selectedPositions: list[int] | None = None
+    concurrency: int = Field(default=1, ge=1, le=8)
 
 
 MESSAGES = {
@@ -164,6 +180,8 @@ MESSAGES = {
     'PLAYLIST_LIMIT': 'A playlist ultrapassa o limite de vídeos. Use uma lista menor.',
     'PLAYLIST_EMPTY': 'Não encontramos vídeos públicos nesta playlist.',
     'PLAYLIST_FAILED': 'Nenhum vídeo da playlist pôde ser preparado.',
+    'INVALID_SELECTION': 'Selecione pelo menos um vídeo válido da lista.',
+    'INVALID_CONCURRENCY': 'Reduza a quantidade de downloads simultâneos.',
     'ADMIN_DISABLED': 'A administração não está configurada.',
     'UNAUTHORIZED': 'Acesso não autorizado.',
 }
@@ -393,20 +411,26 @@ def health():
 @app.post('/api/inspect')
 def inspect(body: InspectBody, request: Request):
     allow_rate(request, 12, 600)
-    url, source = normalized_url(body.url)
+    links = split_links(body.url)
+    if len(links) == 1:
+        url, source = normalized_url(links[0])
+    else:
+        url, source = '', 'YouTube/Vimeo'
     if not inspect_slots.acquire(blocking=False):
         raise api_error('BUSY', 429)
     try:
-        info = inspect_playlist(url) if '/playlist?list=' in url else inspect_media(url)
+        info = inspect_collection(sys.modules[__name__], body.url) if len(links)>1 or '/playlist?list=' in url else inspect_media(url)
     finally:
         inspect_slots.release()
     inspection_id = uuid.uuid4().hex
     with db() as c:
-        c.execute('INSERT INTO inspections VALUES(?,?,?,?)', (inspection_id, url, json.dumps({'source': source, **info}), epoch()))
+        c.execute('INSERT INTO inspections VALUES(?,?,?,?)', (inspection_id, url or body.url.strip(), json.dumps({'source': source, **info}), epoch()))
     return {'inspectionId': inspection_id, 'source': source, **info}
 
 
 def public_job(row: sqlite3.Row) -> dict[str, Any]:
+    if row['kind'] == 'batch':
+        return batch_status(sys.modules[__name__], row)
     result = {'id': row['id'], 'status': row['status'], 'stage': row['stage'],
               'percent': round(row['percent'], 1) if row['percent'] is not None else None,
               'error': {'code': row['error_code'], 'message': MESSAGES.get(row['error_code'], MESSAGES['PROCESSING'])} if row['error_code'] else None,
@@ -448,9 +472,11 @@ def download(body: DownloadBody, request: Request):
         profile = next((p for p in info['profiles'] if p['id'] == body.profileId), None)
         if not profile:
             raise api_error('INVALID_PROFILE', 422)
-        pending = c.execute("SELECT count(*) FROM jobs WHERE status IN ('queued','running')").fetchone()[0]
+        pending = c.execute("SELECT count(*) FROM jobs WHERE status IN ('queued','running') AND parent_id IS NULL").fetchone()[0]
         if pending >= MAX_QUEUE:
             raise api_error('BUSY', 429)
+        if info.get('kind') == 'batch':
+            return create_batch(sys.modules[__name__], body, request, inspection, info, profile)
         if body.publish and not info.get('publicEligible', True):
             raise api_error('UNAVAILABLE', 422)
         job_id, token = uuid.uuid4().hex, secrets.token_urlsafe(32)
@@ -499,6 +525,8 @@ def cancel(job_id: str, token: str = ''):
     row = require_job(job_id, token)
     if row['status'] in ('completed', 'failed', 'expired', 'canceled'):
         return public_job(row)
+    if row['kind'] == 'batch':
+        return cancel_batch(sys.modules[__name__], row)
     with db() as c:
         c.execute('UPDATE jobs SET cancel_requested=1 WHERE id=?', (job_id,))
         if row['status'] == 'queued':
@@ -521,7 +549,7 @@ def safe_filename(title: str, ext: str) -> str:
 @app.get('/api/downloads/{job_id}/file')
 def file(job_id: str, token: str = ''):
     row = require_job(job_id, token)
-    if row['status'] != 'completed' or not row['expires'] or epoch() > row['expires']:
+    if row['kind'] == 'batch' or row['status'] != 'completed' or not row['expires'] or epoch() > row['expires']:
         raise api_error('EXPIRED', 410)
     try:
         allowed = ('.zip',) if row['kind'] == 'playlist' else ('.mp4', '.mp3', '.m4a')
@@ -665,6 +693,8 @@ def execute_job(row: sqlite3.Row) -> None:
     finally:
         with lock:
             processes.pop(job_id, None)
+        if row['parent_id']:
+            refresh_parent(sys.modules[__name__], row['parent_id'])
 
 
 def folder_size(folder: Path) -> int:
@@ -838,15 +868,16 @@ def folder_tree_size(folder: Path) -> int:
 def worker():
     while True:
         with db() as c:
-            job = c.execute("SELECT * FROM jobs WHERE status='queued' AND cancel_requested=0 ORDER BY created,id LIMIT 1").fetchone()
-            if job:
-                claimed = c.execute("UPDATE jobs SET status='running' WHERE id=? AND status='queued' AND cancel_requested=0", (job['id'],)).rowcount
-                if not claimed:
-                    job = None
+            job = claim_next(sys.modules[__name__], c)
         if job:
-            (execute_playlist_job if job['kind'] == 'playlist' else execute_job)(job)
+            try:
+                (execute_playlist_job if job['kind'] == 'playlist' else execute_job)(job)
+            except Exception:
+                set_job(job['id'],status='failed',stage='Falha',error_code='PROCESSING')
+                if job['parent_id']:
+                    refresh_parent(sys.modules[__name__], job['parent_id'])
         else:
-            time.sleep(1)
+            time.sleep(.4)
 
 
 def cleanup():
@@ -871,10 +902,17 @@ def on_startup():
     if runner_started:
         return
     init_db()
-    threading.Thread(target=worker, name='media-worker', daemon=True).start()
+    for i in range(MAX_WORKERS):
+        threading.Thread(target=worker, name=f'media-worker-{i+1}', daemon=True).start()
     threading.Thread(target=cleanup, name='media-cleanup', daemon=True).start()
     runner_started = True
 
+
+from .batch import split_links, inspect_collection, create_batch, batch_status, cancel_batch, claim_next, refresh_parent, MAX_WORKERS
+
+@app.get('/api/capabilities')
+def capabilities():
+    return {'maxConcurrency': MAX_PARALLEL_DOWNLOADS, 'maxBatchItems':MAX_PLAYLIST_ITEMS}
 
 from .admin import install_admin
 install_admin(app, sys.modules[__name__])

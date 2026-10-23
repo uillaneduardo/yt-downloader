@@ -62,3 +62,10 @@ soma das saídas dos itens. Os arquivos intermediários são removidos quando a
 operação termina. Os limites não são uma quota rígida do filesystem e o watchdog
 verifica periodicamente (aproximadamente a cada segundo). Para serviços públicos,
 recomenda-se volume dedicado com quota no nível do sistema de arquivos.
+
+
+## v0.4.0 — fila individual com limite global
+
+Nova execução de lote: `kind=batch` em `jobs` representa um grupo que **não** é baixável diretamente. Para cada posição escolhida, cria-se uma linha `kind=single` com `parent_id`, `position`, hash do token compartilhado, URL canônica, status e pasta própria. Não é criado arquivo ZIP. O limite global dinâmico `MAX_PARALLEL_DOWNLOADS` é configurado pelo administrador e os workers concorrem atomicamente pela fila SQLite; cada lote também aplica seu limite `concurrency` selecionado pelo usuário. Os status individuais são consultados com o token opaco do pai e os arquivos são servidos apenas se concluídos e não expirados. O grupo pode completar com falhas parciais; seu status agregado reporta resultados.
+
+`POST /api/inspect` reconhece texto com múltiplas URLs; a inspeção das URLs únicas utiliza dois workers de metadados, playlists usam `--flat-playlist` e o limite `MAX_PLAYLIST_ITEMS` impede lotes excessivos. A análise registra avisos para URLs individuais indisponíveis e a UI só lista as válidas. Antes de iniciar, o servidor valida posições únicas, limite total e concorrência. Após reinício, filhos em execução não são retomados, mas os filhos ainda enfileirados continuam; os trabalhos ZIP legados que permaneciam na fila são interrompidos. A antiga rota de arquivo de ZIP fica apenas para arquivos concluídos anteriores até expirarem.
