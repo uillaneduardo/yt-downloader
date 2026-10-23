@@ -39,3 +39,5 @@
  .batch-card-prepare{margin-left:0;width:100%}
  .batch-card-progress{flex:1}
 }
+
+.batch-card-cancel{font-size:12px;font-weight:700;margin-left:auto}
