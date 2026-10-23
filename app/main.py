@@ -251,7 +251,8 @@ def inspect_media(url: str) -> dict[str, Any]:
     thumbnail = str(info.get('thumbnail') or '')
     if not thumbnail.startswith('https://'):
         thumbnail = ''
-    return {'title': str(info.get('title') or 'Vídeo')[:300],
+    public_eligible = str(info.get('availability') or 'public').lower() not in ('unlisted', 'private', 'needs_auth', 'premium_only')
+    return {'publicEligible': public_eligible, 'title': str(info.get('title') or 'Vídeo')[:300],
             'author': str(info.get('uploader') or info.get('channel') or '')[:200],
             'duration': int(duration), 'thumbnail': thumbnail,
             'profiles': profiles}
@@ -330,6 +331,8 @@ def download(body: DownloadBody, request: Request):
         pending = c.execute("SELECT count(*) FROM jobs WHERE status IN ('queued','running')").fetchone()[0]
         if pending >= MAX_QUEUE:
             raise api_error('BUSY', 429)
+        if body.publish and not info.get('publicEligible', True):
+            raise api_error('UNAVAILABLE', 422)
         job_id, token = uuid.uuid4().hex, secrets.token_urlsafe(32)
         c.execute('''INSERT INTO jobs
           (id,token_hash,url,title,profile,metadata,publish,source,status,stage,percent,created)
@@ -376,7 +379,10 @@ def cancel(job_id: str, token: str = ''):
     with lock:
         proc = processes.get(job_id)
         if proc and proc.poll() is None:
-            os.killpg(proc.pid, signal.SIGTERM)
+            try:
+                os.killpg(proc.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
     return {'status': 'canceling'}
 
 
@@ -390,7 +396,10 @@ def file(job_id: str, token: str = ''):
     row = require_job(job_id, token)
     if row['status'] != 'completed' or not row['expires'] or epoch() > row['expires']:
         raise api_error('EXPIRED', 410)
-    paths = [p for p in (WORK / job_id).iterdir() if p.is_file() and p.name.startswith('media.') and p.suffix.lower() in ('.mp4', '.mp3', '.m4a')]
+    try:
+        paths = [p for p in (WORK / job_id).iterdir() if p.is_file() and p.name.startswith('media.') and p.suffix.lower() in ('.mp4', '.mp3', '.m4a')]
+    except FileNotFoundError:
+        raise api_error('EXPIRED', 410)
     if not paths:
         raise api_error('EXPIRED', 410)
     mime = {'.mp4': 'video/mp4', '.mp3': 'audio/mpeg', '.m4a': 'audio/mp4'}[paths[0].suffix.lower()]
@@ -523,7 +532,11 @@ def folder_size(folder: Path) -> int:
 def worker():
     while True:
         with db() as c:
-            job = c.execute("SELECT * FROM jobs WHERE status='queued' ORDER BY created,id LIMIT 1").fetchone()
+            job = c.execute("SELECT * FROM jobs WHERE status='queued' AND cancel_requested=0 ORDER BY created,id LIMIT 1").fetchone()
+            if job:
+                claimed = c.execute("UPDATE jobs SET status='running' WHERE id=? AND status='queued' AND cancel_requested=0", (job['id'],)).rowcount
+                if not claimed:
+                    job = None
         if job:
             execute_job(job)
         else:

@@ -79,6 +79,8 @@
     $('media-platform').textContent = info.source;
     $('media-title').textContent = info.title;
     $('media-duration').textContent = [info.author, formatDuration(info.duration)].filter(Boolean).join(' · ');
+    $('public-history').disabled = info.publicEligible === false;
+    if (info.publicEligible === false) $('public-history').checked = false;
     const thumb = safeThumb(info.thumbnail);
     $('poster').classList.toggle('has-thumb', Boolean(thumb));
     $('poster').style.backgroundImage = thumb ? `url(${JSON.stringify(thumb)})` : '';
@@ -203,7 +205,7 @@
     window.scrollTo({top:0,behavior:'smooth'});
   }
   $('url-form').addEventListener('submit', event => { event.preventDefault(); inspect(); });
-  $('url-input').addEventListener('input', () => { ++state.seq; clearError(); });
+  $('url-input').addEventListener('input', () => { ++state.seq; clearError(); $('loading').classList.add('hide'); $('inspect-btn').disabled = false; $('inspect-btn').innerHTML = 'Analisar ' + iconSearch; $('results').classList.add('hide'); });
   $('example-btn').addEventListener('click', () => { $('url-input').value = 'https://www.youtube.com/watch?v=aqz-KE-bpKQ'; inspect(); });
   $('kind-video').addEventListener('click', () => setKind('video'));
   $('kind-audio').addEventListener('click', () => setKind('audio'));

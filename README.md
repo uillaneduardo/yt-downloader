@@ -43,7 +43,7 @@ Consulte [docs/DEPLOY.md](docs/DEPLOY.md) para Cloudflare e homelab e [docs/ARCH
 python3 -m venv .venv && . .venv/bin/activate
 pip install -r requirements.txt pytest httpx
 DATA_DIR=/tmp/yt-downloader-dev uvicorn app.main:app --reload --port 8098
-pytest -q
+python -m pytest -q
 node --check web/app.js
 ```
 
