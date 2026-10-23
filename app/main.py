@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import ipaddress
 import hmac
 import json
 import os
@@ -23,7 +24,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse, parse_qs
 
-from fastapi import FastAPI, HTTPException, Request, Header
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
@@ -260,8 +261,15 @@ def inspect_media(url: str) -> dict[str, Any]:
 
 def client_key(request: Request) -> str:
     # An anonymous ephemeral key; never persisted, never shown in history.
-    remote = request.headers.get('cf-connecting-ip') if os.getenv('TRUST_CF_IP') == '1' else None
-    remote = remote or (request.client.host if request.client else 'unknown')
+    remote = request.client.host if request.client else 'unknown'
+    # Trust the forwarded address only when the tunnel is the sole entrypoint.
+    # A published Docker port may report the Docker gateway as request.client.host.
+    if os.getenv('TRUST_CF_IP') == '1':
+        candidate = request.headers.get('cf-connecting-ip', '')
+        try:
+            remote = str(ipaddress.ip_address(candidate))
+        except ValueError:
+            pass
     return hashlib.sha256(remote.encode()).hexdigest()
 
 
