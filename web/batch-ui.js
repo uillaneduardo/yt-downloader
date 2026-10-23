@@ -43,10 +43,19 @@ function card(entry,index){
  const feedback=el('div','batch-card-feedback');feedback.setAttribute('aria-live','polite');
  const status=el('span','batch-card-state'),progress=el('progress','batch-card-progress hide');
  progress.max=100;progress.value=0;
+ const cancel=el('button','secondary batch-card-cancel hide','Cancelar');
+ cancel.type='button';
+ cancel.onclick=async()=>{
+  const row=rows.get(position);
+  if(!row?.childId||!row?.group)return;
+  cancel.disabled=true;
+  try{await helpers.api('/api/downloads/'+encodeURIComponent(row.childId)+'/cancel'+helpers.params(row.group),{method:'POST'});}
+  catch(e){cancel.disabled=false;helpers.toast(e.message);}
+ };
  const download=el('a','batch-card-download hide','Baixar arquivo');
- feedback.append(status,progress,download);
+ feedback.append(status,progress,cancel,download);
  article.append(top,controls,feedback);
- rows.set(position,{check,kind,quality,prepare,status,progress,download,active:false});
+ rows.set(position,{check,kind,quality,prepare,status,progress,cancel,download,active:false});
  return article;
 }
 function update(data,group){
@@ -54,6 +63,7 @@ function update(data,group){
  for(const item of data.batch.items){
    const c=rows.get(item.position);if(!c)continue;
    c.active=!done(item.status);c.kind.disabled=c.active;c.quality.disabled=c.active;c.prepare.disabled=c.active;
+   c.childId=item.id;c.group=group;c.cancel.classList.toggle('hide',!c.active);c.cancel.disabled=false;
    c.prepare.textContent=c.active?'Preparando…':item.status==='completed'?'Preparar novamente':'Preparar arquivo';
    const pct=typeof item.percent==='number'?Math.max(0,Math.min(100,item.percent)):null;
    c.progress.classList.toggle('hide',!c.active||pct===null);if(pct!==null)c.progress.value=pct;
