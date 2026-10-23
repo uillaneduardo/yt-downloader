@@ -43,7 +43,8 @@ def inspect_collection(m: Any, text: str) -> dict[str, Any]:
         try:
             info = m.inspect_media(url)
             return {'url': url, 'title': info['title'], 'source': source,
-                    'publicEligible': info.get('publicEligible', True), 'thumbnail': info['thumbnail']}
+                    'publicEligible': info.get('publicEligible', True), 'thumbnail': info['thumbnail'],
+                    'profiles': info['profiles'], 'duration': info['duration']}
         except HTTPException as exc:
             return {'url': url, 'error': exc.detail.get('message', 'Mídia indisponível') if isinstance(exc.detail, dict) else 'Mídia indisponível'}
     # Inspect individual URLs in bounded parallelism, not all at once.
@@ -74,10 +75,14 @@ def inspect_collection(m: Any, text: str) -> dict[str, Any]:
     if not entries:
         raise m.api_error('PLAYLIST_EMPTY', 422)
     first = entries[0]
+    profiles = {profile['id']: profile for profile in GENERIC_PROFILES}
+    for entry in entries:
+        for profile in entry.get('profiles', []):
+            profiles[profile['id']] = profile
     return {'kind': 'batch', 'title': first['title'] if len(entries) == 1 else f'{len(entries)} vídeos',
             'author': '', 'duration': None, 'thumbnail': first.get('thumbnail', ''),
             'count': len(entries), 'entries': entries,
-            'warnings': failures, 'profiles': GENERIC_PROFILES,
+            'warnings': failures, 'profiles': list(profiles.values()),
             'publicEligible': all(x['publicEligible'] for x in entries), 'maxConcurrency': m.MAX_PARALLEL_DOWNLOADS}
 
 
@@ -86,6 +91,18 @@ def create_batch(m, body, request, inspection, info, profile):
     entries = info['entries']
     if not selected or len(selected) != len(set(selected)) or any(type(p) is not int or p < 1 or p > len(entries) for p in selected):
         raise m.api_error('INVALID_SELECTION', 422)
+    # Validate each explicitly chosen format against the corresponding inspected media.
+    overrides = body.itemProfiles or {}
+    if (len(overrides) > len(selected) or any(type(position) is not int or
+            position not in selected for position in overrides)):
+        raise m.api_error('INVALID_SELECTION', 422)
+    allowed_profiles = {candidate['id']: candidate for candidate in info['profiles']}
+    if any(profile_id not in allowed_profiles for profile_id in overrides.values()):
+        raise m.api_error('INVALID_PROFILE', 422)
+    for position in selected:
+        available = {p['id'] for p in entries[position - 1].get('profiles', info['profiles'])}
+        if overrides.get(position, profile['id']) not in available:
+            raise m.api_error('INVALID_PROFILE', 422)
     if body.concurrency < 1 or body.concurrency > m.MAX_PARALLEL_DOWNLOADS:
         raise m.api_error('INVALID_CONCURRENCY', 422)
     if body.publish and not all(entries[p - 1]['publicEligible'] for p in selected):
@@ -104,22 +121,23 @@ def create_batch(m, body, request, inspection, info, profile):
                    0, 'YouTube/Vimeo', 'queued', 'Na fila', 0, m.epoch(), 'batch', body.concurrency, ip))
         for pos in selected:
             item = entries[pos - 1]
+            item_profile = allowed_profiles[overrides.get(pos, profile['id'])]
             c.execute('''INSERT INTO jobs (id,token_hash,url,title,profile,metadata,publish,source,status,stage,
                           percent,created,kind,parent_id,position,client_ip)
                          VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',
-                      (uuid.uuid4().hex, hashed, item['url'], item['title'], json.dumps(profile), int(body.metadata),
+                      (uuid.uuid4().hex, hashed, item['url'], item['title'], json.dumps(item_profile), int(body.metadata),
                        int(body.publish), item['source'], 'queued', 'Na fila', None, m.epoch(), 'single',job_id,pos,ip))
     return {'id': job_id, 'token': token, 'status': 'queued', 'kind': 'batch'}
 
 
 def batch_status(m, row):
     with m.db() as c:
-        children = c.execute('''SELECT id,position,title,status,stage,percent,error_code,filename,filesize,expires
+        children = c.execute('''SELECT id,position,title,profile,status,stage,percent,error_code,filename,filesize,expires
                                 FROM jobs WHERE parent_id=? ORDER BY position''', (row['id'],)).fetchall()
     items = []
     for x in children:
         items.append({'id': x['id'], 'position': x['position'], 'title': x['title'], 'status': x['status'],
-                      'stage': x['stage'], 'percent': round(x['percent'],1) if x['percent'] is not None else None,
+                      'stage': x['stage'], 'profile': json.loads(x['profile']), 'percent': round(x['percent'],1) if x['percent'] is not None else None,
                       'error': {'code': x['error_code'], 'message': m.MESSAGES.get(x['error_code'], m.MESSAGES['PROCESSING'])} if x['error_code'] else None,
                       'fileName': x['filename'] if x['status'] == 'completed' else None,
                       'fileSize': x['filesize'] if x['status'] == 'completed' else None,
