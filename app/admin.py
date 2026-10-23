@@ -20,6 +20,7 @@ from pydantic import BaseModel, Field
 # Setting name -> (minimum, maximum). Guard storage/CPU against accidental unlimited input.
 BOUNDS = {
     'MAX_FILE_MB': (16, 20480),
+    'MAX_PARALLEL_DOWNLOADS': (1, 8),
     'MAX_TEMP_MB': (64, 65536),
     'MAX_PLAYLIST_TOTAL_MB': (64, 40960),
     'MAX_PLAYLIST_TEMP_MB': (128, 131072),

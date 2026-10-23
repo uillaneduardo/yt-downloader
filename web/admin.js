@@ -5,10 +5,11 @@
   const formatBytes = v => v == null ? '—' : (v >= 1073741824 ? (v / 1073741824).toFixed(2) + ' GB' : v >= 1048576 ? (v / 1048576).toFixed(1) + ' MB' : (v / 1024).toFixed(1) + ' KB');
   const when = value => value ? new Date(value * 1000).toLocaleString('pt-BR') : '—';
   const titles = {
+    MAX_PARALLEL_DOWNLOADS:['Downloads simultâneos','Máximo global de downloads e conversões em paralelo'],
     MAX_FILE_MB:['Arquivo final (MB)','Limite máximo de cada vídeo ou áudio'],
     MAX_TEMP_MB:['Temporários por arquivo (MB)','Espaço durante conversão'],
-    MAX_PLAYLIST_TOTAL_MB:['ZIP da playlist (MB)','Tamanho máximo do pacote final'],
-    MAX_PLAYLIST_TEMP_MB:['Temporários de playlist (MB)','Inclui vídeo, áudio e ZIP'],
+    MAX_PLAYLIST_TOTAL_MB:['ZIP legado (MB)','Aplicado somente a trabalhos antigos'],
+    MAX_PLAYLIST_TEMP_MB:['Temporários de playlist legada (MB)','Apenas trabalhos antigos'],
     MAX_PLAYLIST_ITEMS:['Vídeos por playlist','Número máximo de itens'],
     MAX_DURATION_SECONDS:['Duração máxima (s)','Por vídeo'],
     JOB_TIMEOUT_SECONDS:['Tempo de processamento (s)','Por vídeo'],
