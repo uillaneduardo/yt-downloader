@@ -58,10 +58,13 @@ Antes de exposição pública, configurar WAF/Rate Limiting na Cloudflare, revis
 | Variável | Padrão | Significado |
 |---|---|---|
 | `YT_PORT` | `8098` | Porta local da VM |
-| `MAX_FILE_MB` | `1024` | Tamanho máximo de arquivo |
+| `MAX_FILE_MB` | `1024` | Tamanho máximo do arquivo final individual | 
+| `MAX_TEMP_MB` | `4096` | Espaço intermediário por vídeo em MB |
 | `MAX_DURATION_SECONDS` | `5400` | Duração limite de vídeo |
 | `FILE_TTL_SECONDS` | `7200` | Retenção do arquivo pronto |
 | `JOB_TIMEOUT_SECONDS` | `2700` | Tempo limite por processamento |
+| `MAX_PLAYLIST_TOTAL_MB` | `2048` | Limite do ZIP final de playlist em MB | 
+| `MAX_PLAYLIST_TEMP_MB` | `6144` | Espaço intermediário de playlist em MB | 
 | `TRUST_CF_IP` | `0` | Use `1` somente se o tunnel for a única entrada HTTP (porta bindada em loopback no host). O backend valida o IP recebido do cabeçalho; no container, o peer pode ser o gateway Docker |
 
 ## Homologação manual
@@ -92,3 +95,26 @@ curl -fsS http://127.0.0.1:8098/api/health
 ```
 
 A aplicação aceita URLs `https://www.youtube.com/playlist?list=...`, limita a 20 itens inicialmente, baixa sequencialmente e entrega um arquivo ZIP. Não publica playlists no histórico. Garanta espaço em disco adicional durante a montagem do ZIP. Se um vídeo individual falhar, os demais continuam. Para homologar, teste uma playlist pública de 2 a 3 vídeos curtos, selecione MP4/MP3, confira a ordem no ZIP e teste cancelamento.
+
+## Solução do erro de tamanho (v0.2.1)
+
+Antes, o backend comparava a soma do vídeo, áudio e arquivos de conversão com
+`MAX_FILE_MB`. Isso podia recusar um vídeo final que cabia no limite. Agora,
+o limite final é separado dos intermediários (variável `MAX_TEMP_MB`), sem
+desativar a proteção de espaço.
+
+Atualização na branch de playlists, mantendo o volume e o banco existentes:
+
+```bash
+cd ~/homelab/apps/yt-downloader
+git fetch origin
+git switch --detach origin/feat/youtube-playlists-sequential
+sudo docker compose up -d --build
+sudo docker compose ps
+curl -fsS http://127.0.0.1:8098/api/health
+```
+
+O health check deve indicar `version: 0.2.1`. Caso continue exibindo o erro,
+veja `MAX_FILE_MB` em seu `.env`, confira `df -h .` no servidor e tente
+uma resolução inferior. Um arquivo final realmente acima do limite continua
+sendo recusado. O volume deve comportar os arquivos intermediários.

@@ -48,3 +48,13 @@ A inspeção usa subprocess com timeout. Operações de download têm watchdog e
 - Gestão de disco mais rígida (quota por volume) e métricas operacionais.
 - Política de moderação do histórico, remoção e retenção LGPD.
 - Melhorias de acessibilidade e E2E real com arquivo pequeno licenciado.
+
+### Limite final e espaço intermediário (v0.2.1)
+
+O yt-dlp e o FFmpeg podem manter simultaneamente vídeo, áudio e arquivo de
+conversão. `MAX_FILE_MB` limita somente o arquivo individual entregue; a
+soma dos intermediários é monitorada com `MAX_TEMP_MB`. Para playlists,
+`MAX_PLAYLIST_TOTAL_MB` limita a soma das saídas e o ZIP final, enquanto
+`MAX_PLAYLIST_TEMP_MB` limita a pasta de trabalho incluindo a etapa de ZIP.
+O watchdog avalia espaço periodicamente, não oferece quota física estrita.
+Recomendamos volume de dados isolado com quota no filesystem para uso público.
