@@ -7,6 +7,7 @@ cd ~/homelab/apps
 git clone https://github.com/uillaneduardo/yt-downloader.git
 cd yt-downloader
 cp .env.example .env
+# Ajuste TRUST_CF_IP=1 no .env somente se o Cloudflare Tunnel for a única entrada HTTP
 mkdir -p data
 sudo chown -R 10001:10001 data
 sudo docker compose config --quiet
@@ -61,7 +62,7 @@ Antes de exposição pública, configurar WAF/Rate Limiting na Cloudflare, revis
 | `MAX_DURATION_SECONDS` | `5400` | Duração limite de vídeo |
 | `FILE_TTL_SECONDS` | `7200` | Retenção do arquivo pronto |
 | `JOB_TIMEOUT_SECONDS` | `2700` | Tempo limite por processamento |
-| `TRUST_CF_IP` | `0` | Confia no cabeçalho `CF-Connecting-IP` somente quando origem estiver isolada pelo tunnel |
+| `TRUST_CF_IP` | `0` | Use `1` apenas se o tunnel for a única entrada HTTP (porta bindada em loopback no host). O IP do cabeçalho é validado; no container, o peer pode ser o gateway Docker |
 
 ## Homologação manual
 
