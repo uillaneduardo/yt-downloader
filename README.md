@@ -13,6 +13,7 @@ Aplicação web para inspecionar formatos disponíveis em vídeos do YouTube/Vim
 ```bash
 git clone https://github.com/uillaneduardo/yt-downloader.git
 cd yt-downloader
+# Antes do merge: git fetch origin feat/mvp-downloads-homelab && git switch -c homologacao origin/feat/mvp-downloads-homelab
 cp .env.example .env
 mkdir -p data
 sudo chown -R 10001:10001 data
@@ -21,7 +22,7 @@ docker compose ps
 curl -fsS http://127.0.0.1:8098/api/health
 ```
 
-O Compose publica somente na interface de loopback (`127.0.0.1:8098`), não expondo o serviço diretamente na rede. No Cloudflare Tunnel, crie um hostname público `yt.ulln.com.br` com serviço `http://localhost:8098` (se `cloudflared` roda na VM). Se o conector Cloudflare roda em container, use endereço e rede compatíveis com essa implantação — `localhost` aponta para o próprio container.
+O Compose publica somente na interface de loopback (`127.0.0.1:8098`), não expondo o serviço diretamente na rede. Para limites individuais de visitantes via Cloudflare Tunnel, ative `TRUST_CF_IP=1` no `.env` **somente** quando o túnel for a única entrada HTTP; sem isso, visitantes podem compartilhar um único limite de requisições pelo endereço do proxy. No Cloudflare Tunnel, crie um hostname público `yt.ulln.com.br` com serviço `http://localhost:8098` (se `cloudflared` roda na VM). Se o conector Cloudflare roda em container, use endereço e rede compatíveis com essa implantação — `localhost` aponta para o próprio container.
 
 > **Atenção:** esta é a primeira versão para homologação, não um serviço público irrestrito. Há limites de requisições e fila, mas sem CAPTCHA, mitigação avançada de abuso, autenticação administrativa ou monitoramento operacional. Publicar apenas depois de verificar políticas de uso, espaço e tráfego.
 
