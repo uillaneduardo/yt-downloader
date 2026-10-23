@@ -34,7 +34,11 @@ DATA = Path(os.getenv('DATA_DIR', '/data')).resolve()
 WORK = DATA / 'jobs'
 WEB = Path(__file__).resolve().parents[1] / 'web'
 DB_PATH = DATA / 'app.sqlite3'
-MAX_BYTES = int(os.getenv('MAX_FILE_MB', '1024')) * 1024 * 1024
+MAX_FILE_MB = max(1, int(os.getenv('MAX_FILE_MB', '1024')))
+MAX_BYTES = MAX_FILE_MB * 1024 * 1024
+# Video, audio and conversion output may coexist temporarily.
+MAX_TEMP_MB = max(MAX_FILE_MB, int(os.getenv('MAX_TEMP_MB', str(max(4096, 4 * MAX_FILE_MB)))))
+MAX_TEMP_BYTES = MAX_TEMP_MB * 1024 * 1024
 MAX_DURATION = int(os.getenv('MAX_DURATION_SECONDS', '5400'))
 EXPIRES_SECONDS = int(os.getenv('FILE_TTL_SECONDS', '7200'))
 INSPECT_TTL = 1800
@@ -42,11 +46,15 @@ INSPECT_TIMEOUT = 45
 JOB_TIMEOUT = int(os.getenv('JOB_TIMEOUT_SECONDS', '2700'))
 MAX_QUEUE = 10
 MAX_PLAYLIST_ITEMS = max(1, min(50, int(os.getenv('MAX_PLAYLIST_ITEMS', '20'))))
-MAX_PLAYLIST_TOTAL_BYTES = int(os.getenv('MAX_PLAYLIST_TOTAL_MB', '2048')) * 1024 * 1024
+MAX_PLAYLIST_TOTAL_MB = max(1, int(os.getenv('MAX_PLAYLIST_TOTAL_MB', '2048')))
+MAX_PLAYLIST_TOTAL_BYTES = MAX_PLAYLIST_TOTAL_MB * 1024 * 1024
+# ZIP creation may temporarily duplicate all of the completed videos.
+MAX_PLAYLIST_TEMP_MB = max(MAX_PLAYLIST_TOTAL_MB * 2, int(os.getenv('MAX_PLAYLIST_TEMP_MB', str(max(6144, 3 * MAX_PLAYLIST_TOTAL_MB)))))
+MAX_PLAYLIST_TEMP_BYTES = MAX_PLAYLIST_TEMP_MB * 1024 * 1024
 PLAYLIST_INSPECT_TIMEOUT = 90
 MAX_INSPECT_CONCURRENT = 2
 HOST = os.getenv('PUBLIC_HOST', 'yt.ulln.com.br')
-APP_VERSION = '0.2.0'
+APP_VERSION = '0.2.1'
 
 DATA.mkdir(parents=True, exist_ok=True)
 WORK.mkdir(parents=True, exist_ok=True)
@@ -137,7 +145,10 @@ MESSAGES = {
     'UNAVAILABLE': 'Este vídeo não está disponível para download.',
     'FORMATS': 'Nenhum formato compatível foi encontrado.',
     'TOO_LONG': 'O vídeo excede a duração permitida.',
-    'TOO_LARGE': 'O arquivo excede o tamanho permitido.',
+    'TOO_LARGE': f'O arquivo excedeu o limite de {MAX_FILE_MB} MB. Escolha uma qualidade menor.',
+    'TEMP_LIMIT': 'O processamento excedeu o espaço temporário configurado no servidor.',
+    'PLAYLIST_TOTAL_LIMIT': f'A playlist excedeu o limite total de {MAX_PLAYLIST_TOTAL_MB} MB.',
+    'NO_SPACE': 'O servidor está sem espaço disponível para preparar este arquivo.',
     'TIMED_OUT': 'A operação demorou demais. Tente novamente.',
     'BUSY': 'Há muitas solicitações agora. Tente novamente em instantes.',
     'INSPECTION_EXPIRED': 'Esta análise expirou. Analise o link novamente.',
@@ -239,6 +250,10 @@ def profiles_from(info: dict[str, Any]) -> list[dict[str, Any]]:
 
 def failure_code(stderr: str) -> str:
     s = stderr.lower()
+    if any(v in s for v in ('no space left on device', 'errno 28', 'disk full')):
+        return 'NO_SPACE'
+    if any(v in s for v in ('max-filesize', 'larger than max filesize', 'file is larger than', 'file size exceeds')):
+        return 'TOO_LARGE'
     if any(v in s for v in ('private video', 'private video.', 'permission', 'login required', 'sign in')):
         return 'PRIVATE'
     if any(v in s for v in ('not available', 'unavailable', 'copyright', 'geo-restricted', 'forbidden', 'unsupported url')):
@@ -560,6 +575,7 @@ def execute_job(row: sqlite3.Row) -> None:
     proc = None
     deadline = time.monotonic() + JOB_TIMEOUT
     last_output = ''
+    stop_reason: list[str] = []
     try:
         proc = subprocess.Popen(command, cwd=str(folder), stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                 text=True, errors='replace', bufsize=1, start_new_session=True)
@@ -571,7 +587,11 @@ def execute_job(row: sqlite3.Row) -> None:
             while proc.poll() is None:
                 with db() as c:
                     state = c.execute('SELECT cancel_requested FROM jobs WHERE id=?', (job_id,)).fetchone()
-                if (state and state['cancel_requested']) or time.monotonic() >= deadline or folder_size(folder) >= MAX_BYTES:
+                reason = ('CANCELED' if state and state['cancel_requested'] else
+                          'TIMED_OUT' if time.monotonic() >= deadline else
+                          'TEMP_LIMIT' if folder_size(folder) >= MAX_TEMP_BYTES else None)
+                if reason:
+                    stop_reason.append(reason)
                     try:
                         os.killpg(proc.pid, signal.SIGTERM)
                     except ProcessLookupError:
@@ -597,10 +617,12 @@ def execute_job(row: sqlite3.Row) -> None:
             canceled = c.execute('SELECT cancel_requested FROM jobs WHERE id=?', (job_id,)).fetchone()['cancel_requested']
         if canceled:
             raise RuntimeError('CANCELED')
+        if stop_reason:
+            raise RuntimeError(stop_reason[0])
         if time.monotonic() >= deadline:
             raise RuntimeError('TIMED_OUT')
-        if folder_size(folder) >= MAX_BYTES:
-            raise RuntimeError('TOO_LARGE')
+        if folder_size(folder) >= MAX_TEMP_BYTES:
+            raise RuntimeError('TEMP_LIMIT')
         if rc != 0:
             raise RuntimeError(failure_code(last_output))
         results = [p for p in folder.iterdir() if p.is_file() and p.suffix.lower() == '.' + ext]
@@ -613,6 +635,10 @@ def execute_job(row: sqlite3.Row) -> None:
         size = final.stat().st_size
         if size > MAX_BYTES:
             raise RuntimeError('TOO_LARGE')
+        # Only the finished file should occupy storage after processing.
+        for temporary in folder.iterdir():
+            if temporary.is_file() and temporary != final:
+                temporary.unlink(missing_ok=True)
         filename = safe_filename(row['title'], ext)
         finished = epoch()
         with db() as c:
@@ -670,10 +696,10 @@ def execute_playlist_job(row: sqlite3.Row) -> None:
             if playlist_cancelled(job_id):
                 raise RuntimeError('CANCELED')
             # Stop if aggregate storage has reached the safe limit.
-            if folder_tree_size(folder) >= MAX_PLAYLIST_TOTAL_BYTES:
-                set_playlist_item(job_id, position, status='failed', stage='Falha', error_code='TOO_LARGE')
-                for pending in entries[position:]:
-                    set_playlist_item(job_id, pending['position'], status='failed', stage='Falha', error_code='TOO_LARGE')
+            accumulated = sum(path.stat().st_size for _, path in successes)
+            if accumulated >= MAX_PLAYLIST_TOTAL_BYTES:
+                for pending in entries[position-1:]:
+                    set_playlist_item(job_id, pending['position'], status='failed', stage='Falha', error_code='PLAYLIST_TOTAL_LIMIT')
                 break
             item_folder = folder / f'work-{position:03d}'
             item_folder.mkdir(mode=0o700, exist_ok=True)
@@ -688,6 +714,7 @@ def execute_playlist_job(row: sqlite3.Row) -> None:
             code = None
             tail = ''
             proc = None
+            stop_reason: list[str] = []
             try:
                 proc = subprocess.Popen(command, cwd=str(item_folder), stdout=subprocess.PIPE,
                                         stderr=subprocess.STDOUT, text=True, errors='replace',
@@ -696,9 +723,12 @@ def execute_playlist_job(row: sqlite3.Row) -> None:
                     processes[job_id] = proc
                 def watchdog():
                     while proc.poll() is None:
-                        if (playlist_cancelled(job_id) or time.monotonic() >= deadline or
-                                folder_tree_size(folder) >= MAX_PLAYLIST_TOTAL_BYTES or
-                                folder_tree_size(item_folder) >= MAX_BYTES):
+                        reason = ('CANCELED' if playlist_cancelled(job_id) else
+                                  'TIMED_OUT' if time.monotonic() >= deadline else
+                                  'TEMP_LIMIT' if folder_tree_size(folder) >= MAX_PLAYLIST_TEMP_BYTES or
+                                                  folder_tree_size(item_folder) >= MAX_TEMP_BYTES else None)
+                        if reason:
+                            stop_reason.append(reason)
                             try:
                                 os.killpg(proc.pid, signal.SIGTERM)
                             except ProcessLookupError:
@@ -726,16 +756,22 @@ def execute_playlist_job(row: sqlite3.Row) -> None:
                 rc = proc.wait()
                 if playlist_cancelled(job_id):
                     raise RuntimeError('CANCELED')
+                if stop_reason:
+                    raise RuntimeError(stop_reason[0])
                 if time.monotonic() >= deadline:
                     raise RuntimeError('TIMED_OUT')
-                if folder_tree_size(folder) >= MAX_PLAYLIST_TOTAL_BYTES or folder_tree_size(item_folder) >= MAX_BYTES:
-                    raise RuntimeError('TOO_LARGE')
+                if folder_tree_size(folder) >= MAX_PLAYLIST_TEMP_BYTES or folder_tree_size(item_folder) >= MAX_TEMP_BYTES:
+                    raise RuntimeError('TEMP_LIMIT')
                 if rc != 0:
                     raise RuntimeError(failure_code(tail))
                 output = [f for f in item_folder.iterdir() if f.is_file() and f.suffix.lower() == '.' + ext]
                 if not output:
                     raise RuntimeError('PROCESSING')
                 selected = max(output, key=lambda f: f.stat().st_size)
+                if selected.stat().st_size > MAX_BYTES:
+                    raise RuntimeError('TOO_LARGE')
+                if accumulated + selected.stat().st_size > MAX_PLAYLIST_TOTAL_BYTES:
+                    raise RuntimeError('PLAYLIST_TOTAL_LIMIT')
                 name = f'{position:02d} - {safe_filename(item["title"], ext)}'
                 target = folder / name
                 selected.replace(target)
@@ -763,7 +799,7 @@ def execute_playlist_job(row: sqlite3.Row) -> None:
             for _, path in successes:
                 out.write(path, arcname=path.name)
         if archive.stat().st_size > MAX_PLAYLIST_TOTAL_BYTES:
-            raise RuntimeError('TOO_LARGE')
+            raise RuntimeError('PLAYLIST_TOTAL_LIMIT')
         for _, path in successes:
             path.unlink(missing_ok=True)
         finished = epoch()
