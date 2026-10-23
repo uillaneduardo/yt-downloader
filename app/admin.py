@@ -20,6 +20,7 @@ from pydantic import BaseModel, Field
 # Setting name -> (minimum, maximum). Guard storage/CPU against accidental unlimited input.
 BOUNDS = {
     'MAX_FILE_MB': (16, 20480),
+    'MAX_PARALLEL_DOWNLOADS': (1, 8),
     'MAX_TEMP_MB': (64, 65536),
     'MAX_PLAYLIST_TOTAL_MB': (64, 40960),
     'MAX_PLAYLIST_TEMP_MB': (128, 131072),
@@ -254,6 +255,31 @@ def install_admin(app, m):
                 fail('INVALID_LIMITS', f'{key}: valor permitido entre {low} e {high}.', 422)
         apply_limits(body.limits)
         return {'limits':current_limits(), 'message':'Limites atualizados.'}
+
+    @app.get('/api/admin/jobs/{job_id}/file')
+    def admin_download_file(job_id: str, request: Request):
+        """Download authenticated copies of completed media without a public token."""
+        ensure_admin(request)
+        if len(job_id) != 32 or any(ch not in '0123456789abcdef' for ch in job_id):
+            fail('NOT_FOUND', 'Arquivo não encontrado.', 404)
+        with m.db() as c:
+            row = c.execute('SELECT kind,status,filename FROM jobs WHERE id=?', (job_id,)).fetchone()
+        if not row or row['status'] != 'completed' or row['kind'] == 'batch':
+            fail('NOT_FOUND', 'Arquivo não está disponível.', 404)
+        folder = m.WORK / job_id
+        allowed = ('.zip',) if row['kind'] == 'playlist' else ('.mp4', '.m4a', '.mp3')
+        try:
+            files = [file for file in folder.iterdir() if file.is_file() and not file.is_symlink()
+                     and file.name.startswith('media.') and file.suffix.lower() in allowed]
+        except OSError:
+            files = []
+        if not files:
+            fail('NOT_FOUND', 'Arquivo não encontrado ou removido.', 404)
+        media = files[0]
+        return FileResponse(media, filename=row['filename'] or media.name,
+                            media_type={'.mp4':'video/mp4','.m4a':'audio/mp4','.mp3':'audio/mpeg',
+                                        '.zip':'application/zip'}[media.suffix.lower()],
+                            headers={'Cache-Control':'private, no-store', 'X-Content-Type-Options':'nosniff'})
 
     @app.delete('/api/admin/jobs/{job_id}/files')
     def delete_files(job_id: str, request: Request):
