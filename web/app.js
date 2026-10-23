@@ -121,9 +121,13 @@
     $('poster').classList.toggle('has-thumb', Boolean(thumb));
     $('poster').style.backgroundImage = thumb ? `url(${JSON.stringify(thumb)})` : '';
     setKind(info.profiles.some(p => p.kind === 'video') ? 'video' : 'audio');
+    if (info.kind === 'batch') {
+      $('results').classList.add('hide');
+      window.BatchUI.show(info, { api, params, safeThumb, toast });
+    } else window.BatchUI.hide();
   }
   async function inspect() {
-    if (state.job && !state.job.terminal) { toast('Aguarde ou cancele o processamento atual.'); return; }
+    if ((state.job && !state.job.terminal) || window.BatchUI.busy()) { toast('Aguarde o processamento atual.'); return; }
     const url = $('url-input').value.trim(); const seq = ++state.seq;
     try { sessionStorage.removeItem('lastInspection'); } catch { /* disabled */ }
     clearError(); resetProgress(); state.info = null; $('results').classList.add('hide');
@@ -290,7 +294,7 @@
     window.scrollTo({top:0,behavior:'smooth'});
   }
   $('url-form').addEventListener('submit', event => { event.preventDefault(); inspect(); });
-  $('url-input').addEventListener('input', () => { if (state.job && !state.job.terminal) return; ++state.seq; clearError(); $('loading').classList.add('hide'); $('inspect-btn').disabled = false; $('inspect-btn').innerHTML = 'Analisar ' + iconSearch; $('results').classList.add('hide'); });
+  $('url-input').addEventListener('input', () => { if ((state.job && !state.job.terminal) || window.BatchUI.busy()) return; window.BatchUI.hide(); ++state.seq; clearError(); $('loading').classList.add('hide'); $('inspect-btn').disabled = false; $('inspect-btn').innerHTML = 'Analisar ' + iconSearch; $('results').classList.add('hide'); });
   $('example-btn').addEventListener('click', () => { $('url-input').value = 'https://www.youtube.com/watch?v=aqz-KE-bpKQ'; inspect(); });
   $('kind-video').addEventListener('click', () => setKind('video'));
   $('kind-audio').addEventListener('click', () => setKind('audio'));
