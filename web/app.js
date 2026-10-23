@@ -87,6 +87,7 @@
     setKind(info.profiles.some(p => p.kind === 'video') ? 'video' : 'audio');
   }
   async function inspect() {
+    if (state.job && !state.job.terminal) { toast('Aguarde ou cancele o processamento atual.'); return; }
     const url = $('url-input').value.trim(); const seq = ++state.seq;
     clearError(); resetProgress(); state.info = null; $('results').classList.add('hide');
     if (!url) { msg('Cole um link de vídeo para continuar.'); $('url-input').focus(); return; }
@@ -122,6 +123,10 @@
     return el;
   }
   function renderJob(data) {
+    const active = !['completed','failed','canceled','expired'].includes(data.status);
+    $('url-input').disabled = active;
+    $('inspect-btn').disabled = active;
+    $('example-btn').disabled = active;
     $('prep-panel').classList.remove('hide');
     $('prep-title').textContent = data.error?.message || data.stage || 'Preparando';
     const percent = typeof data.percent === 'number' ? Math.max(0, Math.min(100, data.percent)) : null;
@@ -205,7 +210,7 @@
     window.scrollTo({top:0,behavior:'smooth'});
   }
   $('url-form').addEventListener('submit', event => { event.preventDefault(); inspect(); });
-  $('url-input').addEventListener('input', () => { ++state.seq; clearError(); $('loading').classList.add('hide'); $('inspect-btn').disabled = false; $('inspect-btn').innerHTML = 'Analisar ' + iconSearch; $('results').classList.add('hide'); });
+  $('url-input').addEventListener('input', () => { if (state.job && !state.job.terminal) return; ++state.seq; clearError(); $('loading').classList.add('hide'); $('inspect-btn').disabled = false; $('inspect-btn').innerHTML = 'Analisar ' + iconSearch; $('results').classList.add('hide'); });
   $('example-btn').addEventListener('click', () => { $('url-input').value = 'https://www.youtube.com/watch?v=aqz-KE-bpKQ'; inspect(); });
   $('kind-video').addEventListener('click', () => setKind('video'));
   $('kind-audio').addEventListener('click', () => setKind('audio'));
