@@ -483,6 +483,8 @@ def test_admin_ip_file_management_and_privacy(monkeypatch):
         folder.mkdir(exist_ok=True)
         (folder/'media.mp4').write_bytes(b'fake mp4')
         main.set_job(job_id,status='completed',expires=main.epoch()+1000)
+        assert c.get(f'/api/admin/jobs/{job_id}/file').content == b'fake mp4'
+        assert c.get('/api/admin/jobs/invalid/file').status_code == 404
         removed = c.delete(f'/api/admin/jobs/{job_id}/files',headers={'X-Admin-CSRF':csrf})
         assert removed.status_code == 200,removed.text
         assert not folder.exists()
@@ -593,3 +595,30 @@ def test_batch_global_limit_and_cancel(monkeypatch):
         with main.db() as conn:
             canceled=conn.execute("SELECT count(*) n FROM jobs WHERE parent_id=? AND status='canceled'", (created['id'],)).fetchone()['n']
         assert canceled==1
+def test_admin_download_file_requires_authentication(monkeypatch):
+    import uuid, hashlib, json
+    from fastapi.testclient import TestClient
+    monkeypatch.setenv('ADMIN_PASSWORD', 'admin-test-password-123456789')
+    main.init_db()
+    job_id = uuid.uuid4().hex
+    folder = main.WORK / job_id
+    folder.mkdir(parents=True, exist_ok=True)
+    (folder / 'media.mp3').write_bytes(b'audio bytes')
+    profile = {'id':'audio-mp3-192', 'kind':'audio', 'ext':'MP3', 'label':'192 kbps'}
+    with main.db() as c:
+        c.execute("""INSERT INTO jobs (id,token_hash,url,title,profile,metadata,publish,source,status,stage,
+        percent,filename,created,kind) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+        (job_id,hashlib.sha256(b'secret').hexdigest(),'https://vimeo.com/12345',
+         'Audio',json.dumps(profile),0,0,'Vimeo','completed','Concluído',100,'Audio.mp3',main.epoch(),'single'))
+    with TestClient(main.app) as c:
+        path=f'/api/admin/jobs/{job_id}/file'
+        assert c.get(path).status_code == 401
+        assert c.post('/api/admin/login',json={'password':'admin-test-password-123456789'}).status_code == 200
+        response=c.get(path)
+        assert response.status_code == 200
+        assert response.content == b'audio bytes'
+        assert 'Audio.mp3' in response.headers['content-disposition']
+        assert 'no-store' in response.headers['cache-control']
+        assert c.get('/api/admin/jobs/abcdef/file').status_code == 404
+        (folder / 'media.mp3').unlink()
+        assert c.get(path).status_code == 404
