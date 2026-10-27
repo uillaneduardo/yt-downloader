@@ -1,0 +1,58 @@
+name: Homelab CD
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: read
+  packages: write
+concurrency:
+  group: homelab-${{ github.repository }}
+  cancel-in-progress: false
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    outputs:
+      image: ${{ steps.meta.outputs.image }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build image locally first
+        run: docker build --pull -t homelab-ci:${{ github.sha }} .
+      - name: Determine registry image
+        id: meta
+        run: echo "image=ghcr.io/${GITHUB_REPOSITORY,,}:${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
+      - name: Authenticate to GHCR
+        if: github.event_name == 'push' && vars.HOMELAB_DEPLOY_ENABLED == 'true'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Publish immutable image
+        if: github.event_name == 'push' && vars.HOMELAB_DEPLOY_ENABLED == 'true'
+        run: |
+          docker tag homelab-ci:${{ github.sha }} "${{ steps.meta.outputs.image }}"
+          docker push "${{ steps.meta.outputs.image }}"
+  deploy:
+    if: github.event_name == 'push' && vars.HOMELAB_DEPLOY_ENABLED == 'true'
+    needs: package
+    runs-on: [self-hosted, linux, homelab-deploy]
+    environment: production
+    permissions:
+      contents: read
+      packages: read
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Login to registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Deploy pinned image with rollback
+        env:
+          IMAGE_REF: ${{ needs.package.outputs.image }}
+          DEPLOY_DIR: ${{ vars.HOMELAB_COMPOSE_DIR }}
+          DEPLOY_SERVICE: ${{ vars.HOMELAB_COMPOSE_SERVICE }}
+        run: bash .github/scripts/deploy-homelab.sh
